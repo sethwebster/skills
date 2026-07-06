@@ -1,6 +1,6 @@
 {
   "name": "baton",
   "description": "Verified session/workspace handoff between agents across machines. File parity first, agent launch second, receiver ack third, sender release last.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "keywords": ["handoff", "agent", "session", "tmux", "remote"]
 }

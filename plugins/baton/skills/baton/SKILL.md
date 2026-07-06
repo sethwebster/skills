@@ -9,6 +9,8 @@ description: >-
   Trigger on phrases like pass the baton, baton this session, handoff this
   session, send this work to another machine, continue on the partner server,
   remote Claude, tmux handoff, transfer this repo, or agent-to-agent handoff.
+  Also handles partner management commands: baton add, list, remove, default,
+  and check.
 ---
 
 # Baton
@@ -18,6 +20,56 @@ Handoff is not "send a prompt." A receiver that only gets context can be confide
 The invariant is:
 
 > File parity first. Agent launch second. Receiver acknowledgment third. Sender release last.
+
+## Commands
+
+The invocation may carry a command word (`/baton add`, `/baton send partner2`). Dispatch on the first token. With no command: if the conversation is asking for a handoff, run `send`; otherwise run `list` and show the available commands.
+
+- `add [name]` — add a session partner
+- `list` — show configured partners
+- `remove <name>` — remove a partner
+- `default <name>` — set the default partner
+- `check [name]` — verify a partner is handoff-ready
+- `send [name]` — hand off to a partner (the full flow below)
+- `return` — return handoff to the original sender
+
+Partner commands edit `~/.config/baton/config.json` (shape in Step 0). Read-modify-write: preserve fields you don't recognize; create the file and directory on first `add`.
+
+### add [name]
+
+1. Collect: partner name (default `partner`), `ssh` destination, `handoffDir` (default `~/baton-inbox`), `receiverCommand` (default `claude --remote-control`). Take values from the user's message when present; ask only for what's missing — the minimum is the ssh destination.
+2. Merge into config without touching other hosts. The first partner becomes `defaultHost`.
+3. Run the `check` probes. Save regardless, but report any failure explicitly — an unreachable partner is saved config, not a working handoff target.
+
+### list
+
+Show each partner (name, ssh, handoffDir, receiverCommand) and mark the default. No config → say so and offer `add`.
+
+### remove <name>
+
+Confirm with the user, then delete the host. If it was `defaultHost`: a single remaining host becomes default; otherwise ask which.
+
+### default <name>
+
+Set `defaultHost`. Error if the name doesn't exist.
+
+### check [name]
+
+Probe the partner (the default host if no name):
+
+```bash
+ssh <ssh> 'node --version && tmux -V && command -v <first word of receiverCommand>'
+```
+
+Report each item pass/fail: reachable, node >= 22, tmux present, receiver command found. All must pass before `send` relies on this partner.
+
+### send [name]
+
+The handoff flow below, Step 0 onward. An explicit name overrides `defaultHost`.
+
+### return
+
+The Return Handoff section below, applied from the receiver side.
 
 ## Script Resolution
 
@@ -59,7 +111,7 @@ Read `~/.config/baton/config.json` first:
 ```
 
 - `ssh`: SSH destination. `handoffDir`: where bundles land on the receiver. `receiverCommand`: command that starts the receiver agent (default `claude --remote-control`; overridable for other agents, e.g. opencode).
-- If the config is missing or has no usable host, ask the user for the SSH destination and offer to write the config for next time. Never invent a host. Never hard-code one.
+- If the config is missing or has no usable host, run the `add` command flow (ask for the SSH destination and write the config). Never invent a host. Never hard-code one.
 
 ## Step 1: Context Packet (`HANDOFF.md`)
 
