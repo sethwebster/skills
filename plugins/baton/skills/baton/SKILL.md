@@ -64,6 +64,14 @@ ssh <ssh> 'node --version && tmux -V && command -v <first word of receiverComman
 
 Report each item pass/fail: reachable, node >= 22, tmux present, receiver command found. All must pass before `send` relies on this partner. Also run Agent Discovery and report which agent CLIs the partner has — if the configured `receiverCommand` is missing but others were found, offer them; update config only with the user's choice, never by silent substitution.
 
+### send [name]
+
+The handoff flow below, Step 0 onward. An explicit name overrides `defaultHost`.
+
+### return
+
+The Return Handoff section below, applied from the receiver side.
+
 ## Agent Discovery
 
 Probe a partner for known agent CLIs in one ssh call (login shell, so PATH additions from the user's profile apply):
@@ -80,14 +88,6 @@ Extend the probe list with any other agent CLI the user mentions. Map found bina
 | anything else (`opencode`, `codex`, `gemini`, `hermes`, `openclaw`, ...) | the bare binary, run interactively inside tmux |
 
 Only Claude supports `--remote-control`; for every other CLI the receiver is a plain interactive session in tmux and the handoff prompt is injected with `tmux send-keys` (confirm the UI is ready before sending Enter). Present the found options to the user and let them choose — never pick a different agent than the configured one without asking.
-
-### send [name]
-
-The handoff flow below, Step 0 onward. An explicit name overrides `defaultHost`.
-
-### return
-
-The Return Handoff section below, applied from the receiver side.
 
 ## Script Resolution
 
