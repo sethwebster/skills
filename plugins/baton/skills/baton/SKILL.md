@@ -34,6 +34,7 @@ The invocation may carry a command word (`/baton add`, `/baton send partner2`). 
 - `return` — return handoff to the original sender
 - `status [name]` — compare local and remote against the last recorded handoff
 - `history [name]` — show past handoffs from the ledger
+- `clean [name]` — remove the last handoff's remote workspace, only when provably safe
 
 Partner commands edit `~/.config/baton/config.json` (shape in Step 0). Read-modify-write: preserve fields you don't recognize; create the file and directory on first `add`.
 
@@ -70,6 +71,23 @@ Report each item pass/fail: reachable, node >= 22, tmux present, receiver comman
 
 The handoff flow below, Step 0 onward. An explicit name overrides `defaultHost`.
 
+Use the deterministic script path for SCP bundle sends when possible:
+
+```bash
+node "$BATON" send \
+  --workspace "$WORKSPACE" \
+  --config ~/.config/baton/config.json \
+  --handoff "$WORKSPACE/HANDOFF.md" \
+  --evidence-dir /tmp/baton \
+  --mode scp-bundle \
+  --partner <name> \
+  --dry-run true
+```
+
+The JSON output is the command graph and terminal state. In dry-run it does not contact ssh/scp/tmux. In real SCP bundle mode it may run the planned commands, but it must still fail closed: no tmux launch before remote bundle verification, and no release before receiver acknowledgment validates the workspace path, manifest hash, next step, and verification gate. For `--mode github-branch`, the script returns `blocked` with `git_mode_requires_operator`; do not auto-push from the script.
+
+Always pass `--ledger ~/.config/baton/history.jsonl` — the script then appends the Handoff Ledger record itself on every terminal state; do not append a duplicate by hand.
+
 ### return
 
 The Return Handoff section below, applied from the receiver side.
@@ -94,6 +112,25 @@ Compare to the record: remote `manifestHash`/`git.head` differ → the remote is
 ### history [name]
 
 Read `~/.config/baton/history.jsonl` and show the records (filtered by partner when named), newest first: timestamp, direction, partner, mode, short `manifestHash`, short `git.head`, status. Missing file → no handoffs yet.
+
+### clean [name]
+
+Remove the last handoff's remote workspace — destructive, so the script proves safety first:
+
+```bash
+node "$BATON" clean \
+  --config ~/.config/baton/config.json \
+  --ledger ~/.config/baton/history.jsonl \
+  --partner <name> \
+  --dry-run true
+```
+
+The script looks up the newest ledger record for the partner, refuses any remote directory that is not a `baton-*-workspace` inside the partner's `handoffDir` (`unsafe_remote_dir`), checks the directory exists (`nothing_to_clean` when absent), re-hashes the remote by piping this script over ssh, and compares against the recorded `manifestHash`:
+
+- **Remote unchanged since the handoff** (hash matches the record — clearly behind or equal): safe. Re-run without `--dry-run` to remove it. The removal is `rm -rf` of only the verified workspace directory; inbox bundle files are untouched.
+- **Remote ahead or diverged** (hash differs — the receiver did work): the script returns `blocked` / `remote_ahead_requires_force` with both hashes. Show the user the evidence and warn that removing loses receiver work. Only after the user explicitly confirms, re-run with `--force true`.
+
+Never pass `--force` on your own judgment — it requires the user's explicit confirmation in this conversation. A successful clean appends a `direction: "cleaned"` record to the ledger automatically.
 
 ## Handoff Ledger
 
@@ -221,6 +258,19 @@ Runs remotely with no install by piping the script over ssh:
 ```bash
 ssh <ssh> 'node --input-type=module - workspace-hash --workspace <dir>' < "$BATON"
 ```
+
+### `send --workspace <path> --config <path> --handoff <path> --evidence-dir <path> --mode scp-bundle [--partner <name>] [--dry-run true] [--run-id <id>]`
+
+Automates the deterministic portion of send. It covers config lookup, partner resolution, `HANDOFF.md` existence and inside-workspace validation before any remote command, partner check command, agent discovery command, workspace hash, git preflight, bundle create, excluded-sensitive stop state, scp transfer command, remote bundle verify into a fresh receiver directory, tmux launch command, tmux session check, pane capture, prompt injection command, and receiver acknowledgment validation. Pass `--run-id` to make remote directory and tmux session names predictable; otherwise the script generates a timestamp run id.
+
+Output JSON includes `status`, `reason`, ordered `steps`, and when available `evidencePath`, `attachCommand`, `remoteDir`, and `manifestHash`. Terminal states are explicit:
+
+- `released` — remote parity and receiver acknowledgment validated.
+- `blocked` — deterministic precondition failed, such as missing `HANDOFF.md`, sensitive exclusions, or git mode requiring an operator.
+- `failed` — deterministic operation failed, such as remote bundle verification.
+- `needs_operator` — safe automation reached an interactive or judgment boundary, such as dry-run completion, trust prompts, or incomplete acknowledgment.
+
+The AI/operator fallback begins only at `blocked`, `failed`, or `needs_operator`. Do not paper over those states with alternate commands unless the operator makes the decision.
 
 ## Decision Tree
 
