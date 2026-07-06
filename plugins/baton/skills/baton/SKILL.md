@@ -69,7 +69,7 @@ Report each item pass/fail: reachable, node >= 22, tmux present, receiver comman
 Probe a partner for known agent CLIs in one ssh call (login shell, so PATH additions from the user's profile apply):
 
 ```bash
-ssh <ssh> 'bash -lc "for c in claude opencode codex gemini hermes openclaw amp aider goose; do command -v \"\$c\" >/dev/null 2>&1 && echo \"\$c\"; done"'
+ssh <ssh> 'bash -lc "for c in claude opencode codex gemini hermes openclaw amp aider goose; do command -v \"\$c\" >/dev/null 2>&1 && echo \"\$c\"; done; true"'
 ```
 
 Extend the probe list with any other agent CLI the user mentions. Map found binaries to receiver commands:
