@@ -37,9 +37,10 @@ Partner commands edit `~/.config/baton/config.json` (shape in Step 0). Read-modi
 
 ### add [name]
 
-1. Collect: partner name (default `partner`), `ssh` destination, `handoffDir` (default `~/baton-inbox`), `receiverCommand` (default `claude --remote-control`). Take values from the user's message when present; ask only for what's missing — the minimum is the ssh destination.
-2. Merge into config without touching other hosts. The first partner becomes `defaultHost`.
-3. Run the `check` probes. Save regardless, but report any failure explicitly — an unreachable partner is saved config, not a working handoff target.
+1. Collect: partner name (default `partner`), `ssh` destination, `handoffDir` (default `~/baton-inbox`). Take values from the user's message when present; ask only for what's missing — the minimum is the ssh destination.
+2. Discover agents on the partner (see Agent Discovery) and offer the found CLIs back to the user to pick `receiverCommand`. If exactly one is found, propose it; if none, ask the user what to use and say none of the known CLIs were found.
+3. Merge into config without touching other hosts. The first partner becomes `defaultHost`.
+4. Run the remaining `check` probes. Save regardless, but report any failure explicitly — an unreachable partner is saved config, not a working handoff target.
 
 ### list
 
@@ -61,7 +62,24 @@ Probe the partner (the default host if no name):
 ssh <ssh> 'node --version && tmux -V && command -v <first word of receiverCommand>'
 ```
 
-Report each item pass/fail: reachable, node >= 22, tmux present, receiver command found. All must pass before `send` relies on this partner.
+Report each item pass/fail: reachable, node >= 22, tmux present, receiver command found. All must pass before `send` relies on this partner. Also run Agent Discovery and report which agent CLIs the partner has — if the configured `receiverCommand` is missing but others were found, offer them; update config only with the user's choice, never by silent substitution.
+
+## Agent Discovery
+
+Probe a partner for known agent CLIs in one ssh call (login shell, so PATH additions from the user's profile apply):
+
+```bash
+ssh <ssh> 'bash -lc "for c in claude opencode codex gemini hermes openclaw amp aider goose; do command -v \"\$c\" >/dev/null 2>&1 && echo \"\$c\"; done"'
+```
+
+Extend the probe list with any other agent CLI the user mentions. Map found binaries to receiver commands:
+
+| CLI | receiverCommand |
+| --- | --- |
+| `claude` | `claude --remote-control` (remote-control receiver — preferred) |
+| anything else (`opencode`, `codex`, `gemini`, `hermes`, `openclaw`, ...) | the bare binary, run interactively inside tmux |
+
+Only Claude supports `--remote-control`; for every other CLI the receiver is a plain interactive session in tmux and the handoff prompt is injected with `tmux send-keys` (confirm the UI is ready before sending Enter). Present the found options to the user and let them choose — never pick a different agent than the configured one without asking.
 
 ### send [name]
 
