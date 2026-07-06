@@ -2,7 +2,7 @@
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
 const excludedNames = new Set(['.git', 'node_modules', 'dist', 'build', '.DS_Store'])
 const sensitiveAllowlist = new Set(['.env.example', '.env.sample', '.env.template'])
@@ -92,9 +92,8 @@ function computeManifest(root, { withData }) {
     return entry
   })
   const manifestValue = {
-    version: 1,
+    version: 2,
     mode: 'bundle',
-    rootName: root.split(sep).filter(Boolean).at(-1) ?? 'workspace',
     files: entries.map(({ path, size, sha256 }) => ({ path, size, sha256 })),
   }
   const manifestHash = hash(Buffer.from(canonicalJson(manifestValue)))
