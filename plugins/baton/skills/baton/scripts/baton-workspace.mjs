@@ -35,6 +35,11 @@ function main() {
     return
   }
 
+  if (command === 'workspace-hash') {
+    printJson(workspaceHash(requiredOption(options, 'workspace')))
+    return
+  }
+
   usage()
 }
 
@@ -58,7 +63,8 @@ function requiredOption(options, key) {
 function gitPreflight(workspace) {
   const root = resolve(workspace)
   if (!existsSync(join(root, '.git'))) return { mode: 'git', available: false, reason: 'NotGitRepository' }
-  const head = runGit(root, ['rev-parse', 'HEAD'])
+  let head
+  try { head = runGit(root, ['rev-parse', 'HEAD']) } catch { return { mode: 'git', available: false, reason: 'NoCommits' } }
   const branch = runGit(root, ['branch', '--show-current'])
   const status = runGit(root, ['status', '--porcelain=v1'])
   return {
@@ -72,8 +78,7 @@ function gitPreflight(workspace) {
   }
 }
 
-function createBundle({ workspace, bundle, manifest }) {
-  const root = resolve(workspace)
+function computeManifest(root, { withData }) {
   const { candidates, skippedSymlinks, excludedSensitive } = collectFiles(root)
   const excludedIgnored = listGitIgnored(root, candidates)
   const ignoredSet = new Set(excludedIgnored)
@@ -81,8 +86,10 @@ function createBundle({ workspace, bundle, manifest }) {
   const entries = candidates.filter((path) => !ignoredSet.has(path)).map((path) => {
     const data = readFileSync(join(root, path))
     totalBytes += data.byteLength
-    if (totalBytes > maxBundleBytes) throw new Error('Workspace too large for JSON bundle (>256MiB): use GitHub branch handoff instead')
-    return { path, size: data.byteLength, sha256: hash(data), data: data.toString('base64') }
+    if (withData && totalBytes > maxBundleBytes) throw new Error('Workspace too large for JSON bundle (>256MiB): use GitHub branch handoff instead')
+    const entry = { path, size: data.byteLength, sha256: hash(data) }
+    if (withData) entry.data = data.toString('base64')
+    return entry
   })
   const manifestValue = {
     version: 1,
@@ -91,10 +98,24 @@ function createBundle({ workspace, bundle, manifest }) {
     files: entries.map(({ path, size, sha256 }) => ({ path, size, sha256 })),
   }
   const manifestHash = hash(Buffer.from(canonicalJson(manifestValue)))
+  return { entries, manifestValue, manifestHash, skippedSymlinks, excludedSensitive, excludedIgnored }
+}
+
+function createBundle({ workspace, bundle, manifest }) {
+  const root = resolve(workspace)
+  const { entries, manifestValue, manifestHash, skippedSymlinks, excludedSensitive, excludedIgnored } = computeManifest(root, { withData: true })
   const bundleValue = { version: 1, manifestHash, files: entries }
   writeJsonFile(manifest, manifestValue)
   writeJsonFile(bundle, bundleValue)
   return { mode: 'bundle', fileCount: entries.length, manifestHash, skippedSymlinks, excludedSensitive, excludedIgnored }
+}
+
+function workspaceHash(workspace) {
+  const root = resolve(workspace)
+  const { manifestValue, manifestHash, skippedSymlinks, excludedSensitive, excludedIgnored } = computeManifest(root, { withData: false })
+  const preflight = gitPreflight(root)
+  const git = preflight.available ? { head: preflight.head, branch: preflight.branch, dirty: preflight.dirty } : null
+  return { mode: 'hash', manifestHash, fileCount: manifestValue.files.length, git, skippedSymlinks, excludedSensitive, excludedIgnored }
 }
 
 function verifyBundle({ bundle, manifest, output }) {
@@ -204,6 +225,7 @@ function usage() {
     '  baton-workspace.mjs git-preflight --workspace <path>',
     '  baton-workspace.mjs bundle-create --workspace <path> --bundle <path> --manifest <path>',
     '  baton-workspace.mjs bundle-verify --bundle <path> --manifest <path> --output <path>',
+    '  baton-workspace.mjs workspace-hash --workspace <path>',
   ].join('\n'))
 }
 

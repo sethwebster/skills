@@ -32,6 +32,8 @@ The invocation may carry a command word (`/baton add`, `/baton send partner2`). 
 - `check [name]` — verify a partner is handoff-ready
 - `send [name]` — hand off to a partner (the full flow below)
 - `return` — return handoff to the original sender
+- `status [name]` — compare local and remote against the last recorded handoff
+- `history [name]` — show past handoffs from the ledger
 
 Partner commands edit `~/.config/baton/config.json` (shape in Step 0). Read-modify-write: preserve fields you don't recognize; create the file and directory on first `add`.
 
@@ -71,6 +73,37 @@ The handoff flow below, Step 0 onward. An explicit name overrides `defaultHost`.
 ### return
 
 The Return Handoff section below, applied from the receiver side.
+
+### status [name]
+
+Answer two questions against the last ledger record for the partner (see Handoff Ledger): has the remote moved ahead, and is local still what was sent?
+
+1. Read the newest ledger record for the partner (newest overall if no name). No record → say so and stop.
+2. **Local**: `node "$BATON" workspace-hash --workspace <recorded workspace>` — compare `manifestHash` and `git.head` to the record. Mismatch means local changed since the handoff.
+3. **Remote**: run the same hash on the receiver without any remote install by piping the script over ssh:
+
+```bash
+ssh <ssh> 'node --input-type=module - workspace-hash --workspace <recorded remoteDir>' < "$BATON"
+```
+
+Compare to the record: remote `manifestHash`/`git.head` differ → the remote is ahead (the receiver did work).
+
+4. For `github-branch` mode also `git fetch` locally and compare the recorded branch tip to the recorded SHA.
+5. Report one verdict — `in-sync` (both match the record), `remote-ahead`, `local-ahead`, or `diverged` (both changed) — plus the evidence hashes. `diverged` means a return handoff needs explicit reconciliation; never merge silently.
+
+### history [name]
+
+Read `~/.config/baton/history.jsonl` and show the records (filtered by partner when named), newest first: timestamp, direction, partner, mode, short `manifestHash`, short `git.head`, status. Missing file → no handoffs yet.
+
+## Handoff Ledger
+
+`~/.config/baton/history.jsonl` — append-only, one JSON object per line, written by the sender after every handoff attempt that reaches a terminal state (released, failed, or abandoned). Before transfer, capture the workspace fingerprint with `workspace-hash` (both modes — not just bundles) and record:
+
+```json
+{"at":"<ISO8601 UTC>","direction":"sent","partner":"<name>","ssh":"<dest>","mode":"github-branch|scp-bundle","workspace":"/abs/local/path","remoteDir":"<verified receiver dir>","manifestHash":"sha256:<from workspace-hash>","git":{"head":"<sha>","branch":"<branch>","dirty":false},"tmuxSession":"<name>","receiverCommand":"<cmd>","status":"released|failed|incomplete"}
+```
+
+`git` is `null` for non-repo workspaces. A `return` handoff appends its own record with `direction: "returned"`. This ledger is what `status` compares against — skipping the append breaks later drift detection.
 
 ## Agent Discovery
 
@@ -146,6 +179,12 @@ BEFORE creating the branch or bundle, write `HANDOFF.md` at the workspace root c
 
 Because it is written before transfer, `HANDOFF.md` rides the branch or bundle and is covered by the same parity verification. The injected receiver prompt references it instead of restating everything.
 
+After writing `HANDOFF.md`, capture the workspace fingerprint for the ledger (see Handoff Ledger):
+
+```bash
+node "$BATON" workspace-hash --workspace "$WORKSPACE"
+```
+
 ## Script CLI
 
 `node "$BATON" <command> ...` — self-contained, node stdlib only.
@@ -170,6 +209,18 @@ Output JSON: `{ mode: 'bundle', fileCount, manifestHash, skippedSymlinks, exclud
 Verifies manifest hash binding and every file's path, size, and sha256, then extracts into `<output>`. Refuses a non-empty output directory (`Output directory not empty: <path>`) — it never deletes anything. Path traversal is rejected.
 
 Output JSON: `{ verified: true, fileCount, manifestHash }`
+
+### `workspace-hash --workspace <path>`
+
+Fingerprints a workspace without writing anything: the same exclusion rules and content-addressed `manifestHash` as `bundle-create` (identical tree → identical hash), plus git state when the workspace is a repo.
+
+Output JSON: `{ mode: 'hash', manifestHash, fileCount, git: { head, branch, dirty } | null, skippedSymlinks, excludedSensitive, excludedIgnored }`
+
+Runs remotely with no install by piping the script over ssh:
+
+```bash
+ssh <ssh> 'node --input-type=module - workspace-hash --workspace <dir>' < "$BATON"
+```
 
 ## Decision Tree
 
@@ -321,6 +372,7 @@ The handoff is complete only when all checks pass:
 - Receiver states the next step.
 - Receiver states the verification gate.
 - Sender records evidence.
+- Sender appends the ledger record to `~/.config/baton/history.jsonl`.
 - Sender returns the attach command to the user.
 
 ## Return Handoff
@@ -347,6 +399,8 @@ Write an evidence file containing:
 - receiver acknowledgment
 - attach command
 - pass/fail status
+
+Then append the ledger record (Handoff Ledger section) — the evidence file is the human artifact, the ledger line is what `status` reads.
 
 ## Failure Handling
 
