@@ -14,6 +14,7 @@ Claude Code plugin marketplace for my agent skills.
 | Plugin | Description |
 | --- | --- |
 | [baton](./plugins/baton) | Verified session/workspace handoff between agents across machines — file parity first, agent launch second, receiver ack third, sender release last. |
+| [dispatch](./plugins/dispatch) | Delegate a scoped task to a remote agent over SSH and get the verified result back — authenticated handshake, right-sized context, HMAC-signed heartbeats, verified-before-integration. You stay the orchestrator. |
 
 ## Maintenance
 
