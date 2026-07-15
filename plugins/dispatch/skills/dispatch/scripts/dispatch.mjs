@@ -3,7 +3,10 @@
 // Node stdlib only. Ships to the worker so both sides canonicalize + HMAC identically.
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
+
+const defaultModeState = join(homedir(), '.config', 'dispatch', 'mode.json')
 
 const excludedNames = new Set(['.git', 'node_modules', 'dist', 'build', '.DS_Store'])
 const sensitiveAllowlist = new Set(['.env.example', '.env.sample', '.env.template'])
@@ -25,6 +28,12 @@ function main() {
       return exitJson(checkHeartbeat(options))
     case 'verify-result':
       return exitJson(verifyResult(options))
+    case 'mode':
+      return printJson(readMode(options.get('state')))
+    case 'set-mode':
+      return printJson(setMode(options))
+    case 'reminder-check':
+      return reminderCheck(options)
     default:
       usage()
   }
@@ -126,6 +135,60 @@ function verifyResult(options) {
   const recomputed = manifest(new Map([['root', options.get('root')]])).manifestHash
   const manifestMatch = typeof result.manifestHash === 'string' && recomputed === result.manifestHash
   return { result: { verified: true, manifestMatch, claimed: result.manifestHash ?? null, recomputed }, ok: manifestMatch }
+}
+
+// --- fleet mode (auto-offload disposition) --------------------------------
+
+// The fleet-availability flag the periodic-reminder hook reads. `available`
+// gates whether the local agent is nudged to offload heavy/screen-conflicting
+// tasks; `reminderIntervalMinutes` throttles the nudge so it is periodic, not
+// per-turn.
+function readMode(statePath) {
+  const path = statePath || defaultModeState
+  if (!existsSync(path)) return { available: false, reminderIntervalMinutes: 30, lastReminderAt: null, statePath: resolve(path), initialized: false }
+  const state = readJsonFile(path)
+  return {
+    available: Boolean(state.available),
+    reminderIntervalMinutes: Number(state.reminderIntervalMinutes ?? 30),
+    lastReminderAt: state.lastReminderAt ?? null,
+    statePath: resolve(path),
+    initialized: true,
+  }
+}
+
+function setMode(options) {
+  const path = options.get('state') || defaultModeState
+  const current = readMode(path)
+  const next = {
+    available: options.has('available') ? options.get('available') === 'true' : current.available,
+    reminderIntervalMinutes: options.has('interval-minutes') ? Number(options.get('interval-minutes')) : current.reminderIntervalMinutes,
+    // Flipping availability re-arms the reminder so the user sees confirmation promptly.
+    lastReminderAt: options.has('available') ? null : current.lastReminderAt,
+  }
+  writeJsonFile(path, next)
+  return { ...next, statePath: resolve(path) }
+}
+
+// reminder-check — the hook entrypoint. Emits the offload nudge ONLY when the
+// fleet is available AND the throttle interval has elapsed, updating the
+// timestamp so the reminder stays periodic. Any other case: no output, exit 0
+// (a silent hook adds nothing to the turn).
+function reminderCheck(options) {
+  const path = options.get('state') || defaultModeState
+  const state = readMode(path)
+  if (!state.available) return
+  const now = Date.now()
+  const last = state.lastReminderAt ? Date.parse(state.lastReminderAt) : null
+  const dueMs = state.reminderIntervalMinutes * 60 * 1000
+  if (last !== null && Number.isFinite(last) && now - last < dueMs) return
+  writeJsonFile(path, { available: true, reminderIntervalMinutes: state.reminderIntervalMinutes, lastReminderAt: new Date(now).toISOString() })
+  const text =
+    '[dispatch: fleet available] Before starting significant local work, judge whether this task should be offloaded to a remote worker instead of run here. Offload when it would (a) tie up the local screen / GUI / simulator / browser, (b) consume heavy CPU / RAM / IO, (c) run long, or (d) parallelize cleanly across machines. If so, propose `/dispatch send` to a configured worker rather than running locally. If nothing is configured yet, mention `/dispatch add`. Otherwise proceed locally — do not force offloading.'
+  if (options.get('format') === 'json') {
+    printJson({ hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: text } })
+  } else {
+    process.stdout.write(`${text}\n`)
+  }
 }
 
 // --- context collection ---------------------------------------------------
@@ -248,6 +311,9 @@ function usage() {
       '  verify          --key <hex> --in <signed.json>',
       '  check-heartbeat --key <hex> --in <hb.json> [--max-stale-seconds N] [--deadline <iso>]',
       '  verify-result   --key <hex> --result <result.json> [--root <extracted-dir>]',
+      '  mode            [--state <path>]',
+      '  set-mode        --available true|false [--interval-minutes N] [--state <path>]',
+      '  reminder-check  [--state <path>] [--format json]   # hook entrypoint',
     ].join('\n') + '\n',
   )
   process.exit(2)

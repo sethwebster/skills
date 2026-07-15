@@ -35,6 +35,9 @@ The invariant is:
 
 The invocation may carry a command word (`/dispatch add worker2`, `/dispatch status dsp-...`). Dispatch on the first token. With no command: if the conversation is asking to delegate a task, run `send`; otherwise run `list` and show the commands.
 
+- `enable` — make the fleet available and turn on the periodic auto-offload reminder
+- `disable` — make the fleet unavailable and silence the reminder
+- `mode` — show whether the fleet is available and the reminder interval
 - `add [name]` — register a worker server
 - `list` — show configured workers
 - `remove <name>` — remove a worker
@@ -48,6 +51,30 @@ The invocation may carry a command word (`/dispatch add worker2`, `/dispatch sta
 - `history` — show past dispatches from the ledger
 
 Worker commands edit `~/.config/dispatch/config.json` (shape in Step 0). Read-modify-write: preserve fields you don't recognize; create the file and directory on first `add`.
+
+`enable`/`disable`/`mode` edit `~/.config/dispatch/mode.json` (Fleet mode section).
+
+## Fleet mode (auto-offload disposition)
+
+`enable`/`disable` are the user's switch for whether the fleet is **available** — i.e. whether the local agent should proactively offer to offload work to a remote worker. This is a standing disposition, not a one-shot: it must nudge the agent on future turns, not only when `/dispatch` is invoked. That is why it is a **hook**, not skill text or memory — only a hook runs every turn regardless of what the user typed.
+
+- **Mechanism.** The plugin ships a `UserPromptSubmit` hook (`hooks/hooks.json`) that runs `dispatch.mjs reminder-check`. The hook fires only while the dispatch plugin is enabled; on top of that, `reminder-check` emits the nudge **only** when `mode.json` says `available: true` AND the throttle interval has elapsed. Every other turn it prints nothing and exits 0 — no context cost. So there are two independent gates: the plugin being enabled (harness-level), and fleet availability (`/dispatch enable`).
+- **Periodic, not per-turn.** The reminder is throttled to `reminderIntervalMinutes` (default 30). `reminder-check` stamps `lastReminderAt` when it fires, so the user sees it occasionally, not on every prompt.
+- **What the nudge says.** It asks the agent, before starting significant local work, to judge whether the task should be offloaded — offload when it would (a) tie up the local screen / GUI / simulator / browser, (b) consume heavy CPU / RAM / IO, (c) run long, or (d) parallelize cleanly across machines — and if so propose `/dispatch send` rather than running locally. It never forces offloading; local work stays the default.
+
+Commands:
+
+- `enable` — `node "$DISPATCH" set-mode --available true` (optionally `--interval-minutes N`). Confirm the fleet is available; if no worker is configured, tell the user to run `/dispatch add`.
+- `disable` — `node "$DISPATCH" set-mode --available false`. The hook stays installed (it ships with the plugin) but goes silent.
+- `mode` — `node "$DISPATCH" mode`. Report `available`, `reminderIntervalMinutes`, and `lastReminderAt`.
+
+`mode.json`:
+
+```json
+{ "available": true, "reminderIntervalMinutes": 30, "lastReminderAt": "<ISO8601|null>" }
+```
+
+Note: this is separate from the plugin's own enabled state. Turning the whole plugin off is a harness operation (`/plugin disable dispatch@skills` or the `/plugin` menu), not something the skill toggles — a skill cannot reliably re-enable itself once disabled. `enable`/`disable` here govern the fleet disposition while the plugin stays enabled.
 
 ### add [name]
 
@@ -145,6 +172,9 @@ Script commands (`node "$DISPATCH" <cmd>`, node stdlib only, exit code reflects 
 - `verify --key <hex> --in <signed.json>` → `{ verified, ... }`, exit 0/1
 - `check-heartbeat --key <hex> --in <hb.json> [--max-stale-seconds N] [--deadline <iso>]` → `{ verdict: alive|dark|blocked|expired|done|failed, ageSeconds, ... }`, exit 0 only for alive/done
 - `verify-result --key <hex> --result <result.json> [--root <extracted-dir>]` → verifies signature AND re-hashes the returned tree against the signed `manifestHash`
+- `mode [--state <path>]` → reports fleet availability + reminder interval
+- `set-mode --available true|false [--interval-minutes N]` → flips fleet availability (backs `enable`/`disable`)
+- `reminder-check [--state <path>] [--format json]` → hook entrypoint; prints the offload nudge only when available + due, else nothing
 
 ## Send flow
 

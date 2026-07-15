@@ -16,8 +16,8 @@
     {
       "name": "dispatch",
       "source": "./plugins/dispatch",
-      "description": "Delegate a scoped task to a remote agent over SSH and get the verified result back. Authenticated handshake, right-sized context, HMAC-signed heartbeats, verified-before-integration.",
-      "version": "0.1.0",
+      "description": "Delegate a scoped task to a remote agent over SSH and get the verified result back. Authenticated handshake, right-sized context, HMAC-signed heartbeats, verified-before-integration. Toggle fleet availability for a periodic auto-offload reminder.",
+      "version": "0.2.0",
       "author": {
         "name": "Seth Webster"
       }
