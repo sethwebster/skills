@@ -13,8 +13,9 @@ description: >-
   Trigger on phrases like dispatch this to <host>, send this task to the build
   box, delegate to the remote agent, farm this out, run this on the worker and
   bring back the result, remote agent job, offload to <server>. Also handles
-  setup and worker management: dispatch init, add, list, remove, default,
-  check, enable, and disable.
+  setup and worker management, live steering of a running dispatch, and session
+  listing: dispatch init, add, list, remove, default, check, enable, disable,
+  steer, and sessions.
 ---
 
 # Dispatch
@@ -51,6 +52,8 @@ The invocation may carry a command word (`/dispatch add worker2`, `/dispatch sta
 - `follow [dispatch-id]` — watch heartbeats; on dark, attach the tmux pane and diagnose
 - `recall <dispatch-id>` — abort a dispatch and clean up its remote workspace
 - `history` — show past dispatches from the ledger
+- `sessions` — list live dispatch tmux sessions on each worker, cross-referenced with the ledger and current heartbeat
+- `steer <dispatch-id> <instruction>` — inject a new instruction into a running interactive dispatch (see Steering)
 
 Worker commands edit `~/.config/dispatch/config.json` (shape in Step 0). Read-modify-write: preserve fields you don't recognize; create the file and directory on first `add`.
 
@@ -260,13 +263,24 @@ The worker recomputes `manifest --root $RDIR/context` and it MUST equal the enve
 
 ### Step 4: Launch the worker agent in tmux
 
-Always run the agent inside `tmux` so the human can SSH in, attach, and intervene. Start detached, `cd` into the dispatch dir:
+Always run the agent inside `tmux` so the human can SSH in, attach, and intervene. Start detached, `cd` into the dispatch dir. **Choose the run mode by whether the task is steerable:**
+
+- **Interactive-in-tmux (default for long-running or steerable work).** Launch the agent's interactive TUI in tmux, then drive it with `send-keys` (initial prompt and any later course-corrections). This is the only mode that lets you re-steer a dispatch mid-run without killing it — the same session absorbs follow-ups while keeping all its context. Prefer this whenever the user may want to adjust the task while it runs.
+- **Headless one-shot (fire-and-forget only).** `claude -p`, `codex exec` — pass the prompt via stdin/arg and let it run to completion. Simple, but there is **no live input channel**: you cannot ping it mid-run; a change means kill + relaunch. Use only when the task is fully specified and short.
 
 ```bash
-ssh <ssh> "cd $RDIR && tmux new-session -d -s $dispatchId '<agentCommand>'"
+# interactive (steerable): launch the TUI, then send the prompt
+ssh <ssh> "tmux new-session -d -s $dispatchId \"bash -lc 'cd $RDIR && exec <agentCommand>'\""
+# headless (fire-and-forget): prompt via stdin
+ssh <ssh> "tmux new-session -d -s $dispatchId \"bash -lc 'cd $RDIR && <agentCommand> < prompt.md > agent.log 2>&1'\""
 ```
 
-Inject the DEP receiver prompt (Receiver Contract below) via `tmux send-keys`; for interactive CLIs confirm the UI is ready before sending Enter. For headless modes (`claude -p`, `codex exec`) pass the prompt as the argument/stdin instead.
+Agent-specific launch notes (proven):
+
+- **codex** — headless: `codex exec -s workspace-write --skip-git-repo-check < prompt.md`. Interactive+autonomous: `codex -s workspace-write -a never -c sandbox_workspace_write.network_access=true --search` (`-a never` = no approval pauses; `network_access=true` enables curl/tunnels/fetch; `--search` enables live web search). On first launch codex may show a self-update prompt — `send-keys "2" Enter` to Skip before sending the task, or it blocks.
+- **claude** — headless `claude -p`; interactive `claude` in tmux; `--dangerously-skip-permissions` only on explicit user opt-in.
+
+Inject the DEP receiver prompt (Receiver Contract below): for interactive TUIs, `send-keys` it and confirm the pane is ready before Enter; for headless modes pass it as stdin/arg. For any non-trivial instruction, use the **file+pointer pattern** (see Steering) — never pass long text with quotes/parens directly through `send-keys`.
 
 ### Step 5: Handshake
 
@@ -319,6 +333,40 @@ ssh <ssh> "tmux capture-pane -pt $dispatchId -S -200"
 
 Common dark causes: a trust/permission prompt blocking the agent, a crash, or it is genuinely blocked waiting on input the constraints forbid. Report the pane evidence to the user and offer: nudge (send-keys), extend the deadline, `recall`, or attach (`ssh -t <ssh> 'tmux attach -t <dispatchId>'`). Never silently assume failure.
 
+## steer <dispatch-id> <instruction>
+
+Inject a new instruction into a **running interactive dispatch** without restarting it (only works for interactive-in-tmux agents, Step 4 — headless runs can't be steered; kill + relaunch instead).
+
+**Always use the file+pointer pattern.** Passing arbitrary instruction text straight through `send-keys` breaks on shell quoting the moment it contains quotes, parentheses, or apostrophes — the message silently fails to reach the agent. Instead:
+
+```bash
+# 1. write the instruction to a file locally, scp it into the dispatch dir
+scp instruction.md <ssh>:<RDIR>/steer-<n>.md
+# 2. send a SHORT, quote-safe pointer (no quotes/parens/apostrophes) + Enter
+ssh <ssh> "tmux send-keys -t <dispatchId> -l 'Read the file steer-<n>.md in this directory and follow it exactly. Begin now.'"
+ssh <ssh> "tmux send-keys -t <dispatchId> Enter"
+# 3. confirm it landed
+ssh <ssh> "tmux capture-pane -pt <dispatchId> -S -15"
+```
+
+Have the instruction tell the agent to write a fresh signed heartbeat and a re-signed `result.json` when done, so `status`/`collect` see the update. An interactive agent keeps its full prior context, so a follow-up ("also add phone numbers", "restyle with Material Design") builds on the completed work rather than restarting it.
+
+## sessions
+
+Live view of dispatches in flight. For each worker in config: `ssh <ssh> tmux ls` and match session names against the ledger. A dispatch typically owns `<dispatchId>` (the agent) plus, when a live progress tunnel is used, `<dispatchId>-web` and `<dispatchId>-tun`. Cross-reference with the ledger (status, tunnel URL) and pull the current signed heartbeat per active dispatch. Report per worker: session name → role → status/verdict. Ignore unrelated sessions (e.g. `baton-*`).
+
+## Live progress tunnel (optional)
+
+When the user wants to watch a long dispatch "from anywhere," stand up the viewer as **sender-managed infrastructure in its own tmux sessions**, not inside the agent's sandbox — a sandboxed child process dies when the agent exits, and separate sessions bring the link up immediately and keep it up:
+
+```bash
+ssh <ssh> "tmux new-session -d -s <id>-web  'python3 -m http.server <port> --directory <RDIR>/return/work/site'"
+ssh <ssh> "tmux new-session -d -s <id>-tun  'cloudflared tunnel --url http://localhost:<port> > <RDIR>/cloudflared.log 2>&1'"
+# parse the public URL from cloudflared.log (https://<name>.trycloudflare.com)
+```
+
+Tell the agent (in its prompt) to rewrite `return/work/site/index.html` each phase and keep a `<meta http-equiv="refresh">` so the viewer auto-updates. `cloudflared` quick tunnels need no account; `ngrok`/`tailscale funnel` are alternatives. `recall` must also kill `<id>-web` and `<id>-tun`.
+
 ## collect <dispatch-id>
 
 Pick up and integrate — the part that makes dispatch delegation, not fire-and-forget.
@@ -337,7 +385,7 @@ Both must hold: `verified: true` (authentic) and `manifestMatch: true` (the tree
 
 ## recall <dispatch-id>
 
-Abort and clean up. Signal the worker (send-keys an interrupt / write a `cancel` marker), confirm the tmux session is stopped, and remove **only** the verified `<dispatchDir>/<dispatchId>` directory after confirming with the user — never a path outside `dispatchDir`. If the worker already did work, warn that recall discards it; require explicit confirmation. Append a `recalled` ledger record.
+Abort and clean up. Signal the worker (send-keys an interrupt / write a `cancel` marker), then kill **all** of the dispatch's tmux sessions — the agent `<dispatchId>` plus any `<dispatchId>-web` / `<dispatchId>-tun` tunnel sessions — and confirm they are stopped. Remove **only** the verified `<dispatchDir>/<dispatchId>` directory after confirming with the user — never a path outside `dispatchDir`. If the worker already did work, warn that recall discards it; require explicit confirmation. Append a `recalled` ledger record.
 
 ## Ledger
 
