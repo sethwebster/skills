@@ -13,7 +13,8 @@ description: >-
   Trigger on phrases like dispatch this to <host>, send this task to the build
   box, delegate to the remote agent, farm this out, run this on the worker and
   bring back the result, remote agent job, offload to <server>. Also handles
-  worker management: dispatch add, list, remove, default, and check.
+  setup and worker management: dispatch init, add, list, remove, default,
+  check, enable, and disable.
 ---
 
 # Dispatch
@@ -33,8 +34,9 @@ The invariant is:
 
 ## Commands
 
-The invocation may carry a command word (`/dispatch add worker2`, `/dispatch status dsp-...`). Dispatch on the first token. With no command: if the conversation is asking to delegate a task, run `send`; otherwise run `list` and show the commands.
+The invocation may carry a command word (`/dispatch add worker2`, `/dispatch status dsp-...`). Dispatch on the first token. With no command: if there is no config yet, run `init`; else if the conversation is asking to delegate a task, run `send`; otherwise run `list` and show the commands.
 
+- `init` — first-run setup: register a worker (import from baton if present), verify it, offer to enable the fleet
 - `enable` — make the fleet available and turn on the periodic auto-offload reminder
 - `disable` — make the fleet unavailable and silence the reminder
 - `mode` — show whether the fleet is available and the reminder interval
@@ -76,9 +78,21 @@ Commands:
 
 Note: this is separate from the plugin's own enabled state. Turning the whole plugin off is a harness operation (`/plugin disable dispatch@skills` or the `/plugin` menu), not something the skill toggles — a skill cannot reliably re-enable itself once disabled. `enable`/`disable` here govern the fleet disposition while the plugin stays enabled.
 
+### init
+
+The guided front door. Run when there is no config, or when the user asks to set dispatch up.
+
+1. **Import or register a worker.** If `~/.config/baton/config.json` exists, list its `hosts` and offer to import them — reuse each host's `ssh` (and any discovered `agentCommand`), adding dispatch's own fields (`dispatchDir`, `heartbeatSeconds`, `maxStaleSeconds`, `deadlineMinutes`). Otherwise run `add`. Never copy secrets; import only ssh/discovery values.
+2. **Verify** each imported/added worker with `check` (reachable, node, tmux, agent CLI) and run Agent Discovery so `agentCommand` is real, not assumed.
+3. **Set the default worker** if there is exactly one; else ask.
+4. **Offer fleet mode.** Ask whether to `enable` the periodic auto-offload reminder now (default off — the user opts in). Explain it in one line.
+5. Report the final state: workers configured, default, fleet availability. This is also a good moment to remind that the bundled reminder hook only fires once `dispatch@skills` is installed and enabled in the harness.
+
+`init` is orchestration over existing commands — it writes nothing the individual commands don't.
+
 ### add [name]
 
-1. Collect: worker name (default `worker`), `ssh` destination, `dispatchDir` (default `~/dispatch-inbox`), and defaults `heartbeatSeconds` (300), `maxStaleSeconds` (900), `deadlineMinutes` (60). Take values from the user's message; ask only for what's missing — the minimum is the ssh destination.
+1. Collect: worker name (default `worker`), `ssh` destination, `dispatchDir` (default `~/dispatch-inbox`), and defaults `heartbeatSeconds` (300), `maxStaleSeconds` (900), `deadlineMinutes` (60). Take values from the user's message; ask only for what's missing — the minimum is the ssh destination. If baton has a host with the same `ssh`, offer to reuse its `agentCommand`.
 2. Discover agents on the worker (see Agent Discovery) and offer the found CLIs so the user picks `agentCommand`. Propose it if exactly one; ask if none, saying none of the known CLIs were found.
 3. Merge into config without touching other workers. The first worker becomes `defaultWorker`.
 4. Run the `check` probes. Save regardless, but report any failure explicitly.
@@ -353,4 +367,6 @@ The key is recorded here (local, 0600 dir) so `status`/`collect` can verify late
 
 ## Interop with baton
 
-Same author, same marketplace, complementary primitives: **baton** = give the whole session away and release (parity-verified handoff); **dispatch** = keep ownership, delegate a scoped task, get the verified result back. If a dispatch grows into "just take this over," escalate to `/baton send`. If a worker's config already exists for baton, reuse the `ssh`/discovery values — but dispatch keeps its own config because it adds return, heartbeat, deadline, and per-dispatch keying.
+Same author, same marketplace, complementary primitives: **baton** = give the whole session away and release (parity-verified handoff); **dispatch** = keep ownership, delegate a scoped task, get the verified result back. If a dispatch grows into "just take this over," escalate to `/baton send`.
+
+The two keep separate configs — dispatch adds return address, heartbeat, deadline, and per-dispatch keying that baton has no use for — but a machine is a machine: `init` and `add` **import** `ssh`/`agentCommand` from `~/.config/baton/config.json` (baton calls them **partners**; dispatch calls the same boxes **workers**, since dispatch delegates to them rather than handing off as peers). So you register a server once and both skills can reach it.

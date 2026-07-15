@@ -1,6 +1,6 @@
 {
   "name": "dispatch",
   "description": "Delegate a scoped task to a remote agent over SSH and get the verified result back. Authenticated handshake, right-sized context, HMAC-signed heartbeats, verified-before-integration — you stay the orchestrator. Toggle fleet availability for a periodic auto-offload reminder.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "keywords": ["dispatch", "delegate", "remote", "agent", "ssh", "tmux", "acp"]
 }
