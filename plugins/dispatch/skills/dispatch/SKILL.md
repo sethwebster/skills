@@ -293,9 +293,9 @@ node "$DISPATCH" verify --key "$KEY" --in /tmp/dispatch/ack.json
 
 Verified ack = two-way handshake complete (the worker proved it holds the key). Confirm the ack states: correct task understanding, verified workspace + context manifest, plan, what it will not do, and the gate. An unverified or context-unconfirmed ack is **not** a started dispatch — stop and diagnose.
 
-### Step 6: Record and detach
+### Step 6: Record and follow
 
-Append the ledger record (Ledger section), report the attach command to the user, then set up monitoring (`follow`). You do **not** block the session waiting; the dispatch is durable and identified by `dispatchId`.
+Append the ledger record (Ledger section), report the attach command to the user, then start monitoring (`follow`). **Do not detach by default.** A dispatch is delegated work, not a handoff: unless the user explicitly requests detach / fire-and-forget / no monitoring, you remain responsible for watching heartbeats, nudging blocked agents, collecting the result, and integrating only after verification. The dispatch is durable and identified by `dispatchId`, but durability is not permission to stop supervising it.
 
 ## Receiver Contract (injected prompt)
 
@@ -322,7 +322,7 @@ Report one verdict: `alive` (working, fresh), `blocked` (worker needs input), `d
 
 ## follow [dispatch-id]
 
-Watch without busy-polling. Poll `status` on the heartbeat interval (use the harness Monitor / scheduled wake-up rather than a tight loop). Two things end the watch:
+Watch without busy-polling. Poll `status` on the heartbeat interval (use the harness Monitor / scheduled wake-up rather than a tight loop). Unless detach was explicitly requested, keep monitoring and nudging until one of the terminal conditions below is reached; do not tell the user to check back later and do not abandon the dispatch after reporting the attach command. Two things end the watch:
 
 - **done/failed** → proceed to `collect`.
 - **dark or expired** → the "followed up if it goes dark" path. SSH in and capture the pane to diagnose:
@@ -331,7 +331,7 @@ Watch without busy-polling. Poll `status` on the heartbeat interval (use the har
 ssh <ssh> "tmux capture-pane -pt $dispatchId -S -200"
 ```
 
-Common dark causes: a trust/permission prompt blocking the agent, a crash, or it is genuinely blocked waiting on input the constraints forbid. Report the pane evidence to the user and offer: nudge (send-keys), extend the deadline, `recall`, or attach (`ssh -t <ssh> 'tmux attach -t <dispatchId>'`). Never silently assume failure.
+Common dark causes: a trust/permission prompt blocking the agent, a crash, or it is genuinely blocked waiting on input the constraints forbid. Report the pane evidence to the user. If the pane shows a recoverable prompt or obvious blocked state, nudge it with `send-keys` and continue following. If a human decision is required, ask exactly one question and keep the dispatch under supervision. Offer extend deadline, `recall`, or attach (`ssh -t <ssh> 'tmux attach -t <dispatchId>'`) only when nudging is unsafe or insufficient. Never silently assume failure.
 
 ## steer <dispatch-id> <instruction>
 
