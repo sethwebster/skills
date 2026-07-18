@@ -13,9 +13,9 @@ description: >-
   Trigger on phrases like dispatch this to <host>, send this task to the build
   box, delegate to the remote agent, farm this out, run this on the worker and
   bring back the result, remote agent job, offload to <server>. Also handles
-  setup and worker management, live steering of a running dispatch, and session
-  listing: dispatch init, add, list, remove, default, check, enable, disable,
-  steer, and sessions.
+  setup and worker management, live steering and low-latency monitoring of a
+  running dispatch, and session listing: dispatch init, add, list, remove,
+  default, check, enable, disable, steer, and sessions.
 ---
 
 # Dispatch
@@ -49,7 +49,7 @@ The invocation may carry a command word (`/dispatch add worker2`, `/dispatch sta
 - `send [name]` — dispatch a task to a worker (the full flow below)
 - `status [dispatch-id]` — pull + verify the heartbeat/result; report alive / blocked / done / failed / dark
 - `collect <dispatch-id>` — pull the signed result, verify it, run the gate, integrate
-- `follow [dispatch-id]` — watch heartbeats; on dark, attach the tmux pane and diagnose
+- `follow [dispatch-id]` — watch heartbeats; on dark, attach the tmux pane and diagnose. `--live` streams the pane in real time (see Live mode)
 - `recall <dispatch-id>` — abort a dispatch and clean up its remote workspace
 - `history` — show past dispatches from the ledger
 - `sessions` — list live dispatch tmux sessions on each worker, cross-referenced with the ledger and current heartbeat
@@ -143,7 +143,7 @@ Present the found options and let the user choose the worker's agent — never p
 
 ## The Dispatch Envelope Protocol (DEP)
 
-DEP is the floor both sides agree to speak (this is the "agreement on ACP usage" — a minimal, agent-agnostic contract, since claude / codex / opencode / hermes do **not** share a formal wire protocol). If a worker natively speaks a richer protocol (MCP, A2A), it may layer that on top, but DEP is always available: JSON files + tmux injection + HMAC, exactly the least-common-denominator that every CLI supports.
+DEP is the floor both sides agree to speak: a minimal, agent-agnostic contract, since claude / codex / opencode / hermes do **not** share a formal wire protocol. It is SSH-native by design — JSON files + tmux injection + HMAC, the least-common-denominator every CLI supports on a box you already have SSH to, with no daemon or HTTP server to stand up. This is deliberately *not* [ACP](https://agentcommunicationprotocol.dev): ACP is a REST/HTTP agent-as-a-service standard, an orthogonal architecture. DEP borrows ACP's *ideas* where useful (typed messages, async-first long-running tasks, capability discovery) but implements none of its wire format and is not interoperable with it. If a worker natively speaks a richer protocol (MCP, ACP, A2A), it may layer that on top; DEP is always available as the fallback.
 
 Every message both directions is a JSON object signed with the shared key. Never hand-compute the HMAC — always use the script so canonicalization is byte-identical on both machines.
 
@@ -322,7 +322,7 @@ Report one verdict: `alive` (working, fresh), `blocked` (worker needs input), `d
 
 ## follow [dispatch-id]
 
-Watch without busy-polling. Poll `status` on the heartbeat interval (use the harness Monitor / scheduled wake-up rather than a tight loop). Unless detach was explicitly requested, keep monitoring and nudging until one of the terminal conditions below is reached; do not tell the user to check back later and do not abandon the dispatch after reporting the attach command. Two things end the watch:
+Watch without busy-polling. Poll `status` on the heartbeat interval (use the harness Monitor / scheduled wake-up rather than a tight loop). For low-latency watching — seeing the agent's output as it happens rather than on the interval — run `follow --live` (see Live mode below); the signed heartbeat/result remain the source of truth regardless. Unless detach was explicitly requested, keep monitoring and nudging until one of the terminal conditions below is reached; do not tell the user to check back later and do not abandon the dispatch after reporting the attach command. Two things end the watch:
 
 - **done/failed** → proceed to `collect`.
 - **dark or expired** → the "followed up if it goes dark" path. SSH in and capture the pane to diagnose:
@@ -350,6 +350,42 @@ ssh <ssh> "tmux capture-pane -pt <dispatchId> -S -15"
 ```
 
 Have the instruction tell the agent to write a fresh signed heartbeat and a re-signed `result.json` when done, so `status`/`collect` see the update. An interactive agent keeps its full prior context, so a follow-up ("also add phone numbers", "restyle with Material Design") builds on the completed work rather than restarting it.
+
+`send-keys` reaches the interactive TUI immediately, so steering is already low-latency. Live mode (below) just means you are watching the pane stream when you send it, so you see the agent react without re-pulling.
+
+## Live mode (SSH-native, optional)
+
+`follow` and `steer` default to poll-based signals — heartbeats on the interval, `status` pulls. When you want to watch in real time or course-correct fast, run them in **live mode**: real-time streaming over the SSH channel you already hold, with **no new port, daemon, or protocol**. This is the SSH-native answer to "stand up a socket for live comms" — SSH is already an authenticated, confidential socket, so multiplex it instead of building a second one. DEP (signed files) stays the floor; live mode is observation glue that never touches the trust decision.
+
+**Reuse one connection.** Open a persistent master so live-follow and repeated `steer`/`status` calls don't pay a TCP+auth handshake each time:
+
+```bash
+# ~/.ssh/config (or pass the -o flags inline on each ssh call)
+Host <worker-host>
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%r@%h:%p
+  ControlPersist 10m
+```
+
+**Stream the pane live (`follow --live`).** Tee the agent's tmux pane to a file on the worker, then `tail -f` it down the master connection:
+
+```bash
+ssh <ssh> "tmux pipe-pane -t <dispatchId> -o 'cat >> <RDIR>/return/pane.log'"
+ssh <ssh> "tail -n +1 -f <RDIR>/return/pane.log"
+```
+
+You now see output as it happens instead of on the heartbeat interval. `-o` makes the pipe persist across commands; a bare `pipe-pane` (no `-o`) toggles it back off. Reading `pane.log` is observation only — `status`, `collect`, and every integration decision still run off the **signed** heartbeat/result, never the stream.
+
+**Push-on-blocked.** If the worker must reach *you* fast (it hit a question the constraints don't cover), have the receiver prompt, on block, write a `blocked` heartbeat **immediately** (not on the interval) and append a one-line `NEEDINPUT: <question>` marker to `pane.log`. Your live `tail -f` surfaces it at once; you answer with `steer`. This closes the blocked-agent round-trip without any inbound channel.
+
+**Teardown.** Live mode adds **no** tmux sessions, so `recall` is unchanged. Stop the pane pipe and drop the master when done:
+
+```bash
+ssh <ssh> "tmux pipe-pane -t <dispatchId>"   # no -o = stop teeing
+ssh -O exit <ssh>                             # close the master connection
+```
+
+When would a real socket protocol beat this? Only if dispatch grows into a **persistent worker fleet with a standing control plane** — sub-second bidirectional RPC, presence, backpressure, multiplexed cancellable streams. At that point layer **MCP / ACP / A2A** on top rather than rolling your own; DEP remains the fallback. For scoped request/response — what dispatch is — live mode over SSH covers it. See `design/live-monitoring.md` for the full rationale.
 
 ## sessions
 
