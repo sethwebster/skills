@@ -5,452 +5,135 @@ description: >-
   a task to a remote agent on another server and get the result back — not a
   full session handoff (that is baton), but a scoped request/response where you
   stay the orchestrator. It negotiates SSH, discovers which agent CLIs exist on
-  the worker (claude, opencode, codex, hermes, gemini, aider, goose, ...),
-  packages a right-sized prompt + context, mints a per-dispatch shared key so
-  every message is HMAC-signed and tamper-evident, launches the remote agent in
-  tmux under an agreed envelope protocol, then monitors it — picking up and
-  integrating the verified result when done, and following up if it goes dark.
-  Trigger on phrases like dispatch this to <host>, send this task to the build
-  box, delegate to the remote agent, farm this out, run this on the worker and
-  bring back the result, remote agent job, offload to <server>. Also handles
-  setup and worker management, live steering and low-latency monitoring of a
-  running dispatch, and session listing: dispatch init, add, list, remove,
-  default, check, enable, disable, steer, and sessions.
+  the worker (claude, opencode, codex, gemini, aider, goose, ...), packages a
+  right-sized prompt + context, mints a per-dispatch key so every message is
+  HMAC-signed, launches the remote agent in tmux under an envelope protocol,
+  then monitors it and integrates the verified result. Trigger on phrases like
+  dispatch this to <host>, send this task to the build box, delegate to the
+  remote agent, farm this out, offload to <server>, remote agent job. Also
+  handles worker management, live steering of a running dispatch, and session
+  listing: dispatch init, add, list, remove, default, check, enable, disable,
+  steer, and sessions.
 ---
 
 # Dispatch
 
-Dispatch is delegation, not handoff. You keep ownership of the work: you send a scoped task to a remote agent, it does the work, and **you** pick the result back up and integrate it. Baton gives the session away and releases; dispatch keeps you in the loop as orchestrator.
-
-The invariant is:
+Delegation, not handoff. You send a scoped task to a remote agent, monitor it, and **you** pick the verified result back up and integrate it. Baton gives the session away; dispatch keeps you as orchestrator.
 
 > Authenticated handshake first. Right-sized context second. Signed heartbeats throughout. Verified result before integration. Never integrate unverified or untested remote output.
 
-## Trust model (read once)
-
-- **SSH is the trust bootstrap.** The SSH connection is already authenticated and confidential, so the per-dispatch key travels safely inside the envelope on the way out.
-- **The shared key secures every leg after that.** Once minted, the key (`HMAC-SHA256`, 32 random bytes) signs the dispatch envelope, the receiver's ack, every heartbeat, and the final result. This is what makes the *return address a two-way handshake*: the receiver proves it holds the key by signing its ack; you prove it by verifying. Any middlebox tamper — or any party without the key — fails the HMAC check. The return leg may be asynchronous (a later SSH pull, a git branch, a shared inbox dir) and not ride the original session, which is exactly why signing, not transport alone, is the guarantee.
-- **Integrity is content-addressed.** Context and returned work are fingerprinted with a canonical manifest hash; the hash is carried *inside* the signed envelope, so it cannot be swapped without breaking the signature.
-- **Remote output is untrusted until verified.** Signature valid + manifest matches + your local verification gate passes — only then integrate. Treat returned code as you would a PR from a stranger.
-
-## Commands
-
-The invocation may carry a command word (`/dispatch add worker2`, `/dispatch status dsp-...`). Dispatch on the first token. With no command: if there is no config yet, run `init`; else if the conversation is asking to delegate a task, run `send`; otherwise run `list` and show the commands.
-
-- `init` — first-run setup: register a worker (import from baton if present), verify it, offer to enable the fleet
-- `enable` — make the fleet available and turn on the periodic auto-offload reminder
-- `disable` — make the fleet unavailable and silence the reminder
-- `mode` — show whether the fleet is available and the reminder interval
-- `add [name]` — register a worker server
-- `list` — show configured workers
-- `remove <name>` — remove a worker
-- `default <name>` — set the default worker
-- `check [name]` — verify a worker is dispatch-ready (reachable, node, tmux, agent CLI)
-- `send [name]` — dispatch a task to a worker (the full flow below)
-- `status [dispatch-id]` — pull + verify the heartbeat/result; report alive / blocked / done / failed / dark
-- `collect <dispatch-id>` — pull the signed result, verify it, run the gate, integrate
-- `follow [dispatch-id]` — watch heartbeats; on dark, attach the tmux pane and diagnose. `--live` streams the pane in real time (see Live mode)
-- `recall <dispatch-id>` — abort a dispatch and clean up its remote workspace
-- `history` — show past dispatches from the ledger
-- `sessions` — list live dispatch tmux sessions on each worker, cross-referenced with the ledger and current heartbeat
-- `steer <dispatch-id> <instruction>` — inject a new instruction into a running interactive dispatch (see Steering)
-
-Worker commands edit `~/.config/dispatch/config.json` (shape in Step 0). Read-modify-write: preserve fields you don't recognize; create the file and directory on first `add`.
-
-`enable`/`disable`/`mode` edit `~/.config/dispatch/mode.json` (Fleet mode section).
-
-## Fleet mode (auto-offload disposition)
-
-`enable`/`disable` are the user's switch for whether the fleet is **available** — i.e. whether the local agent should proactively offer to offload work to a remote worker. This is a standing disposition, not a one-shot: it must nudge the agent on future turns, not only when `/dispatch` is invoked. That is why it is a **hook**, not skill text or memory — only a hook runs every turn regardless of what the user typed.
-
-- **Mechanism.** The plugin ships a `UserPromptSubmit` hook (`hooks/hooks.json`) that runs `dispatch.mjs reminder-check`. The hook fires only while the dispatch plugin is enabled; on top of that, `reminder-check` emits the nudge **only** when `mode.json` says `available: true` AND the throttle interval has elapsed. Every other turn it prints nothing and exits 0 — no context cost. So there are two independent gates: the plugin being enabled (harness-level), and fleet availability (`/dispatch enable`).
-- **Periodic, not per-turn.** The reminder is throttled to `reminderIntervalMinutes` (default 30). `reminder-check` stamps `lastReminderAt` when it fires, so the user sees it occasionally, not on every prompt.
-- **What the nudge says.** It asks the agent, before starting significant local work, to judge whether the task should be offloaded — offload when it would (a) tie up the local screen / GUI / simulator / browser, (b) consume heavy CPU / RAM / IO, (c) run long, or (d) parallelize cleanly across machines — and if so propose `/dispatch send` rather than running locally. It never forces offloading; local work stays the default.
-
-Commands:
-
-- `enable` — `node "$DISPATCH" set-mode --available true` (optionally `--interval-minutes N`). Confirm the fleet is available; if no worker is configured, tell the user to run `/dispatch add`.
-- `disable` — `node "$DISPATCH" set-mode --available false`. The hook stays installed (it ships with the plugin) but goes silent.
-- `mode` — `node "$DISPATCH" mode`. Report `available`, `reminderIntervalMinutes`, and `lastReminderAt`.
-
-`mode.json`:
-
-```json
-{ "available": true, "reminderIntervalMinutes": 30, "lastReminderAt": "<ISO8601|null>" }
-```
-
-Note: this is separate from the plugin's own enabled state. Turning the whole plugin off is a harness operation (`/plugin disable dispatch@skills` or the `/plugin` menu), not something the skill toggles — a skill cannot reliably re-enable itself once disabled. `enable`/`disable` here govern the fleet disposition while the plugin stays enabled.
-
-### init
-
-The guided front door. Run when there is no config, or when the user asks to set dispatch up.
-
-1. **Import or register a worker.** If `~/.config/baton/config.json` exists, list its `hosts` and offer to import them — reuse each host's `ssh` (and any discovered `agentCommand`), adding dispatch's own fields (`dispatchDir`, `heartbeatSeconds`, `maxStaleSeconds`, `deadlineMinutes`). Otherwise run `add`. Never copy secrets; import only ssh/discovery values.
-2. **Verify** each imported/added worker with `check` (reachable, node, tmux, agent CLI) and run Agent Discovery so `agentCommand` is real, not assumed.
-3. **Set the default worker** if there is exactly one; else ask.
-4. **Offer fleet mode.** Ask whether to `enable` the periodic auto-offload reminder now (default off — the user opts in). Explain it in one line.
-5. Report the final state: workers configured, default, fleet availability. This is also a good moment to remind that the bundled reminder hook only fires once `dispatch@skills` is installed and enabled in the harness.
-
-`init` is orchestration over existing commands — it writes nothing the individual commands don't.
-
-### add [name]
-
-1. Collect: worker name (default `worker`), `ssh` destination, `dispatchDir` (default `~/dispatch-inbox`), and defaults `heartbeatSeconds` (300), `maxStaleSeconds` (900), `deadlineMinutes` (60). Take values from the user's message; ask only for what's missing — the minimum is the ssh destination. If baton has a host with the same `ssh`, offer to reuse its `agentCommand`.
-2. Discover agents on the worker (see Agent Discovery) and offer the found CLIs so the user picks `agentCommand`. Propose it if exactly one; ask if none, saying none of the known CLIs were found.
-3. Merge into config without touching other workers. The first worker becomes `defaultWorker`.
-4. Run the `check` probes. Save regardless, but report any failure explicitly.
-
-### list / remove / default
-
-Mirror the obvious semantics. `remove` confirms first; if it was `defaultWorker`, a single remaining worker becomes default, else ask which. `default` errors if the name is unknown.
-
-### check [name]
-
-Probe the worker (default if unnamed) in one call, then Agent Discovery:
+**Everything mechanical is the CLI.** `scripts/dispatch.mjs` (next to this file; node stdlib, zero deps) runs on both sides: sender commands own the ssh calls and resolve everything from the ledger by `dispatchId`; the worker runs `worker <sub>` inside its dispatch dir. Your judgment belongs in exactly four places — **which context, the prompt, constraints + gate, and run mode**. Do not re-derive, hand-assemble, or "design" keys, envelopes, signatures, hashes, ssh/tmux/scp incantations, or heartbeat JSON — call the command. Every command prints JSON with a `next` hint; exit code 0/1 = pass/fail.
 
 ```bash
-ssh <ssh> 'node --version && tmux -V && command -v <first word of agentCommand>'
+DISPATCH="<directory containing this SKILL.md>/scripts/dispatch.mjs"   # never assume the user's cwd
+node "$DISPATCH"            # usage
 ```
 
-Report each pass/fail: reachable, node >= 20, tmux present, agent command found. All must pass before `send` relies on it. If the configured `agentCommand` is missing but others were found, offer them — never silently substitute.
+## Trust model
 
-### send [name]
+- **SSH is the trust bootstrap.** The per-dispatch key (HMAC-SHA256, 32 random bytes) travels only inside the SSH channel (`transfer` writes it to `<remoteDir>/key`, mode 0600).
+- **The key signs every leg after that**: envelope, ack, heartbeats, result. The receiver proves it holds the key by signing its ack (two-way handshake). Any tamper or keyless party fails verification.
+- **Integrity is content-addressed.** Context and returned work are fingerprinted (canonical manifest hash) inside signed messages.
+- **Remote output is untrusted until**: signature valid + manifest matches + your local gate passes. Treat returned code like a stranger's PR.
 
-The dispatch flow, Step 0 onward. An explicit name overrides `defaultWorker`.
+## Commands (`/dispatch <cmd>`)
 
-### status / collect / follow / recall / history
+Dispatch on the first token. No command: no config → `init`; the conversation is delegating a task → `send`; else `list`.
 
-See the sections of the same name below.
-
-## Agent Discovery
-
-Probe the worker for known agent CLIs in one login-shell ssh call (so profile PATH additions apply):
-
-```bash
-ssh <ssh> 'bash -lc "for c in claude opencode codex gemini hermes aider goose amp openclaw; do command -v \"\$c\" >/dev/null 2>&1 && echo \"\$c\"; done; true"'
-```
-
-Extend the list with any agent CLI the user names. Map found binaries to launch commands:
-
-| CLI | agentCommand (non-interactive worker) |
+| command | what you do |
 | --- | --- |
-| `claude` | `claude -p` (headless print mode) or interactive in tmux — prefer whichever the worker supports; `--dangerously-skip-permissions` only if the user opts in for an autonomous run |
-| `codex` | `codex exec` (non-interactive) or interactive in tmux |
-| `opencode` | `opencode run` or interactive in tmux |
-| anything else (`gemini`, `hermes`, `aider`, `goose`, ...) | the bare binary, run interactively inside tmux |
+| `init` | first-run: import workers from `~/.config/baton/config.json` (ssh + agentCommand only, never secrets) or run `add`; `check` each; set default if exactly one; offer fleet mode (default off); report |
+| `add [name]` | collect `ssh` (only required input), `dispatchDir` (`~/dispatch-inbox`), `heartbeatSeconds` 300, `maxStaleSeconds` 900, `deadlineMinutes` 60; `node "$DISPATCH" discover <name>` → user picks `agentCommand` (propose if exactly one; never silently substitute); merge into config (first worker = default); run `check` |
+| `list` / `remove <name>` / `default <name>` | edit `~/.config/dispatch/config.json` read-modify-write, preserve unknown fields; `remove` confirms; unknown name errors |
+| `check [name]` | `node "$DISPATCH" check [name]` — reachable, node ≥ 20, tmux, agent binary, **auth probe**. If `auth` ≠ `ok`: give the user the printed `fix` command verbatim, wait for "done", re-run once. Never attempt an OAuth/device-code login yourself |
+| `send [name]` | the Send flow below |
+| `status` / `follow` / `steer` / `collect` / `recall` / `sessions` / `history` | `node "$DISPATCH" <cmd> <id> ...` — see below |
+| `enable` / `disable` / `mode` | `set-mode --available true|false [--interval-minutes N]` / `mode` (Fleet mode) |
 
-Present the found options and let the user choose the worker's agent — never pick a different agent than the configured one without asking. Capability-match when it matters (e.g. a task needing a specific toolchain → the worker that has it).
+Config shape: `{ "defaultWorker": "w", "workers": { "w": { "ssh": "user@host", "dispatchDir": "~/dispatch-inbox", "agentCommand": "codex", "heartbeatSeconds": 300, "maxStaleSeconds": 900, "deadlineMinutes": 60, "lastAuthOkAt": null } } }`. Never invent a worker.
 
-## The Dispatch Envelope Protocol (DEP)
+## Fleet mode
 
-DEP is the floor both sides agree to speak: a minimal, agent-agnostic contract, since claude / codex / opencode / hermes do **not** share a formal wire protocol. It is SSH-native by design — JSON files + tmux injection + HMAC, the least-common-denominator every CLI supports on a box you already have SSH to, with no daemon or HTTP server to stand up. This is deliberately *not* [ACP](https://agentcommunicationprotocol.dev): ACP is a REST/HTTP agent-as-a-service standard, an orthogonal architecture. DEP borrows ACP's *ideas* where useful (typed messages, async-first long-running tasks, capability discovery) but implements none of its wire format and is not interoperable with it. If a worker natively speaks a richer protocol (MCP, ACP, A2A), it may layer that on top; DEP is always available as the fallback.
-
-Every message both directions is a JSON object signed with the shared key. Never hand-compute the HMAC — always use the script so canonicalization is byte-identical on both machines.
-
-**Dispatch envelope** (sender → worker):
-
-```json
-{
-  "dispatchId": "dsp-...",
-  "type": "dispatch",
-  "protocol": "dep/1",
-  "sender": "<who + return contact>",
-  "return": { "method": "ssh-pull|git-branch", "dir": "<remote result dir>", "ref": "<branch, git mode>" },
-  "context": { "manifestHash": "sha256:...", "root": "<remote context dir>" },
-  "prompt": "<the task>",
-  "constraints": ["do not force-push", "do not touch main", "no network exfil", "..."],
-  "gate": "<how the sender will verify the result, e.g. 'pnpm test' passes>",
-  "heartbeatSeconds": 300,
-  "deadline": "<ISO8601>",
-  "hmac": "..."
-}
-```
-
-**Ack** (worker → sender, completes the handshake): `{ dispatchId, type:"ack", agent, workspace, contextManifestVerified:true, understanding, plan, willNotDo, gate, hmac }`.
-
-**Heartbeat** (worker → sender, every `heartbeatSeconds`): `{ dispatchId, type:"heartbeat", status:"working|blocked", updatedAt, progress, hmac }`.
-
-**Result** (worker → sender, on completion): `{ dispatchId, type:"result", status:"done|failed", summary, manifestHash, ref, notes, hmac }`.
-
-## Script Resolution
-
-The script lives next to this SKILL.md at `scripts/dispatch.mjs`. Resolve it relative to wherever the skill is installed — never assume the user's workspace.
-
-```bash
-SKILL_DIR="<directory containing this SKILL.md>"
-DISPATCH="$SKILL_DIR/scripts/dispatch.mjs"
-```
-
-Script commands (`node "$DISPATCH" <cmd>`, node stdlib only, exit code reflects pass/fail for `verify`/`check-heartbeat`/`verify-result`):
-
-- `keygen` → `{ dispatchId, key, algo }`
-- `manifest --root <dir> [--paths-file <f>] [--out <f>]` → content-addressed fingerprint of the curated context (walks the dir, or hashes an exact relative-path list; excludes `.env*` except examples, `.git`, `node_modules`, `dist`, `build`)
-- `sign --key <hex> --in <body.json> [--out <f>]` → adds `hmac`
-- `verify --key <hex> --in <signed.json>` → `{ verified, ... }`, exit 0/1
-- `check-heartbeat --key <hex> --in <hb.json> [--max-stale-seconds N] [--deadline <iso>]` → `{ verdict: alive|dark|blocked|expired|done|failed, ageSeconds, ... }`, exit 0 only for alive/done
-- `verify-result --key <hex> --result <result.json> [--root <extracted-dir>]` → verifies signature AND re-hashes the returned tree against the signed `manifestHash`
-- `mode [--state <path>]` → reports fleet availability + reminder interval
-- `set-mode --available true|false [--interval-minutes N]` → flips fleet availability (backs `enable`/`disable`)
-- `reminder-check [--state <path>] [--format json]` → hook entrypoint; prints the offload nudge only when available + due, else nothing
+`enable`/`disable` set whether you should *proactively* offer to offload work. It is a `UserPromptSubmit` hook (`hooks/hooks.json` → `reminder-check`) because a standing disposition must fire on future turns regardless of what the user typed. The nudge prints only when `mode.json` has `available: true` AND `reminderIntervalMinutes` (30) has elapsed; otherwise nothing. It asks you to propose `/dispatch send` when a task would tie up the local screen/simulator, eat heavy CPU/RAM/IO, run long, or parallelize across machines — never forces it. Separate from the plugin's own enabled state (`/plugin` menu, a harness operation).
 
 ## Send flow
 
-### Step 0: Config
+**0. Worker + auth.** Pick the worker (explicit name > `defaultWorker`). If `lastAuthOkAt` is not today, run `check` first — a signed-out CLI discovered after transfer+launch wastes the whole budget.
 
-Read `~/.config/dispatch/config.json`:
+**1. Right-size the context (judgment).** No more or less than the task needs.
+- In a git repo, **a branch/bundle is the default, not an archive** — the return leg becomes a merge with provenance. Uncommitted state → ask the user to commit for dispatch (ask; don't fall back to files). Worker can reach the remote (`ssh <ssh> git ls-remote <url> HEAD`)? push `dispatch/<slug>` and use `transfer --branch --repo-url`; else `git bundle create ctx.bundle <ref>` and `transfer --bundle`. In both cases `prepare --root` is the checkout and `--ref` is the branch.
+- Non-repo or standalone tasks: curated `--paths-file` (files mode).
+- Secrets never ship (`.env*` excluded by the manifest; report `excludedSensitive`). Needed credentials go out-of-band via the user.
+- Write the **prompt as a file**: goal, exact next step, definition of done, the gate. Reference context by path.
 
-```json
-{
-  "defaultWorker": "worker",
-  "workers": {
-    "worker": {
-      "ssh": "user@host.example.ts.net",
-      "dispatchDir": "~/dispatch-inbox",
-      "agentCommand": "claude -p",
-      "heartbeatSeconds": 300,
-      "maxStaleSeconds": 900,
-      "deadlineMinutes": 60
-    }
-  }
-}
-```
-
-Missing or no usable worker → run `add`. Never invent or hard-code a worker.
-
-### Step 1: Right-size the context
-
-Send **no more or less than necessary**. Decide the task boundary first, then include only what it needs:
-
-- Prefer a **curated file list** over the whole workspace. Write the relative paths to a paths-file and let the manifest hash exactly those.
-- If the task is a repo change and the needed state is committed (or the user approves a commit), the cleanest transfer is a **git branch** the worker checks out — no bundle, and integration is a merge.
-- Never include secrets. The manifest excludes `.env*`; if the task genuinely needs a credential, the user supplies it out-of-band, deliberately.
-- Write the task **prompt** as a file: goal, the exact next step, the definition of done, and the verification gate. Reference the context by path, don't restate files.
-
-Fingerprint the curated context:
-
+**2. Prepare.**
 ```bash
-node "$DISPATCH" manifest --root "$CONTEXT_ROOT" --paths-file "$PATHS" --out /tmp/dispatch/context.manifest.json
+node "$DISPATCH" prepare --worker <name> --root <ctx-root> [--paths-file <f>] --prompt-file <f> \
+  --gate "<how you will verify>" --constraints "do not force-push;do not touch main" [--ref dispatch/<slug>] --out-dir /tmp/dispatch/<slug>
 ```
+Worker defaults come from config; `--heartbeat-seconds/--max-stale-seconds/--deadline-minutes` override. Prints `dispatchId`; from here every command takes that id.
 
-Report `excludedSensitive` and `skippedSymlinks` to the user before transfer.
+**3. Transfer.** `node "$DISPATCH" transfer <id> [--bundle <f> | --branch <ref> --repo-url <url>]` — ships script + envelope + key, places the context, and has the worker recompute the manifest. `manifestMatch:false` → **do not launch**; fix and re-run.
 
-### Step 2: Mint the key and build the signed envelope
+**4. Launch (judgment: run mode).** `node "$DISPATCH" launch <id> --agent "<cmd>" --mode interactive|headless`
+- **interactive** (default; long-running or steerable work): the TUI in tmux; the only mode you can re-steer mid-run with full context kept.
+- **headless** (fire-and-forget only, fully specified short tasks): `claude -p`, `codex exec -s workspace-write --skip-git-repo-check` — no live input channel.
+- Proven agent commands: codex interactive+autonomous `codex -s workspace-write -a never` (add `-c sandbox_workspace_write.network_access=true --search` if the task needs network); claude `claude` / `claude -p`; `--dangerously-skip-permissions` or codex `-a never` only with the user's opt-in for an autonomous run.
+- `launch` starts an `agent` window and a `pulse` window (re-signs heartbeats every `heartbeatSeconds` so liveness costs the agent no tokens; `--pulse false` to disable), auto-dismisses known interstitials (codex self-update → Skip, trust-this-directory → Yes), then injects the receiver prompt via file+pointer. It returns the `attach` command — give it to the user.
 
-```bash
-node "$DISPATCH" keygen   # -> dispatchId, key
-```
+**5. Handshake.** `node "$DISPATCH" await-ack <id>` (timebox 120s, polls every 20s). `ack:"verified"` = the worker proved it holds the key and confirmed the context; read its `understanding`/`plan`/`willNotDo` — if they are wrong, `steer` a correction. `ack:"none"` → the output includes the pane; go to Triage. An unverified ack is **not** a started dispatch.
 
-Compose the envelope body (Step 1 manifest hash, prompt, return address, constraints, gate, deadline, heartbeat interval), then sign it:
+**6. Follow.** `node "$DISPATCH" follow <id>` (run in the background with a Bash `run_in_background`, or poll `status <id>` on a Monitor/scheduled wake-up — never a tight loop). Report the attach command, then **stay on it**: unless the user explicitly asked for fire-and-forget, you keep supervising until a terminal verdict, nudge blocked agents, and collect. Durability by id is not permission to stop.
 
-```bash
-node "$DISPATCH" sign --key "$KEY" --in /tmp/dispatch/envelope.body.json --out /tmp/dispatch/envelope.json
-```
+## Verdicts (`status` / `follow`)
 
-The worker needs the key to verify the envelope and to sign its replies, so the key ships **inside the envelope over SSH** (SSH is the confidential bootstrap). Keep a copy in the local ledger for later `status`/`collect`. Do not print or send the key on any channel other than the SSH transfer.
+`alive` (fresh, progressing) · `idle` (pulse fresh but no progress report in `maxStaleSeconds` — nudge with `steer` if it persists) · `blocked` (agent asked a question: read `progress`, answer via `steer`) · `done` / `failed` → `collect` · `dark` (no signed signal in `maxStaleSeconds`) / `expired` (deadline) / `no-signal` (nothing yet) / `unverified` (bad signature — treat as dark, never as done). Any non-alive verdict includes the pane (or `agent.log` tail for headless) so triage is one call. `follow` exits on the first verdict that needs you.
 
-### Step 3: Transfer
+## Triage (fast-fail, hard budget)
 
-Create a fresh remote dispatch dir and copy the script, the signed envelope, and the curated context there:
+**2 diagnostic actions or ~2 minutes, then escalate to the human.** A whole successful dispatch takes ~5 minutes; ten minutes of solo debugging has already failed. Read the pane from `await-ack`/`status`/`node "$DISPATCH" pane <id>` and act:
 
-```bash
-RDIR="<dispatchDir>/<dispatchId>"
-ssh <ssh> "mkdir -p $RDIR/context $RDIR/return"
-scp "$DISPATCH" /tmp/dispatch/envelope.json <ssh>:$RDIR/
-# curated context: git branch checkout on the worker, OR scp the listed files into $RDIR/context
-```
+| pane shows | action |
+| --- | --- |
+| login URL, device code, "not logged in", 401, invalid API key | **escalate now**: one message — what's wrong, the exact fix (`node "$DISPATCH" check` prints it), what you'll do when they say done. Never run the login flow yourself |
+| a y/n or menu prompt the launcher didn't catch | `steer <id> --keys "<tmux keys>"` with the safe answer if constraints allow (e.g. `--keys "2 Enter"`); else ask the user one question |
+| shell prompt / "command not found" / `[dispatch] agent exited with status N` | agent crashed or never started: re-check `--agent` (`discover`), one relaunch (`launch <id>` again — dir, envelope, context all survive; never re-transfer to recover) |
+| agent visibly working, no ack | `steer <id> --file` a one-line pointer to re-run `node dispatch.mjs worker init` then `worker ack` |
+| anything else | escalate with the pane excerpt |
 
-The worker recomputes `manifest --root $RDIR/context` and it MUST equal the envelope's `context.manifestHash`. A mismatch means the context did not arrive intact — stop, do not launch the agent.
+Offer extend deadline / `recall` / attach only when nudging is unsafe or insufficient. Never silently assume failure.
 
-### Step 4: Launch the worker agent in tmux
+## steer <id>
 
-Always run the agent inside `tmux` so the human can SSH in, attach, and intervene. Start detached, `cd` into the dispatch dir. **Choose the run mode by whether the task is steerable:**
+`node "$DISPATCH" steer <id> --file <instruction.md>` — scp's the file in and sends a short quote-safe pointer (raw text through `send-keys` breaks on quotes; the CLI never does that). Interactive agents keep their context, so follow-ups build on completed work. Tell the instruction to end with `worker heartbeat`/`worker done` so the result is re-signed. `--keys "<tmux keys>"` sends literal keys (`C-c`, `2 Enter`). Headless runs cannot be steered — recall + relaunch.
 
-- **Interactive-in-tmux (default for long-running or steerable work).** Launch the agent's interactive TUI in tmux, then drive it with `send-keys` (initial prompt and any later course-corrections). This is the only mode that lets you re-steer a dispatch mid-run without killing it — the same session absorbs follow-ups while keeping all its context. Prefer this whenever the user may want to adjust the task while it runs.
-- **Headless one-shot (fire-and-forget only).** `claude -p`, `codex exec` — pass the prompt via stdin/arg and let it run to completion. Simple, but there is **no live input channel**: you cannot ping it mid-run; a change means kill + relaunch. Use only when the task is fully specified and short.
+## collect <id>
 
-```bash
-# interactive (steerable): launch the TUI, then send the prompt
-ssh <ssh> "tmux new-session -d -s $dispatchId \"bash -lc 'cd $RDIR && exec <agentCommand>'\""
-# headless (fire-and-forget): prompt via stdin
-ssh <ssh> "tmux new-session -d -s $dispatchId \"bash -lc 'cd $RDIR && <agentCommand> < prompt.md > agent.log 2>&1'\""
-```
+`node "$DISPATCH" collect <id> --into <fresh-empty-dir>` — pulls the work (bundle → `git clone`, or files), verifies **signature AND manifest** (`verified:true`, `manifestMatch:true`; anything else blocks integration). Then **you** run the gate from the output locally, report its result honestly, review the diff as an external PR, integrate with the user's approval for anything hard to reverse (never overlay a dirty tree), and `node "$DISPATCH" mark <id> --status collected`.
 
-Agent-specific launch notes (proven):
+## recall / sessions / history
 
-- **codex** — headless: `codex exec -s workspace-write --skip-git-repo-check < prompt.md`. Interactive+autonomous: `codex -s workspace-write -a never -c sandbox_workspace_write.network_access=true --search` (`-a never` = no approval pauses; `network_access=true` enables curl/tunnels/fetch; `--search` enables live web search). On first launch codex may show a self-update prompt — `send-keys "2" Enter` to Skip before sending the task, or it blocks.
-- **claude** — headless `claude -p`; interactive `claude` in tmux; `--dangerously-skip-permissions` only on explicit user opt-in.
+- `recall <id> [--purge true]` — interrupts the agent, kills `<id>`, `<id>-web`, `<id>-tun`; `--purge` removes only the verified dispatch dir. If work exists, warn it is discarded and require explicit confirmation before purging.
+- `sessions` — per worker: live `dsp-*` tmux sessions cross-referenced with the ledger (`unknown` = not in your ledger; stale `dispatched` past deadline = candidates for `recall`).
+- `history` — merged ledger (`~/.config/dispatch/history.jsonl`, append-only; the key lives there so status/collect work later — never print it).
 
-Inject the DEP receiver prompt (Receiver Contract below): for interactive TUIs, `send-keys` it and confirm the pane is ready before Enter; for headless modes pass it as stdin/arg. For any non-trivial instruction, use the **file+pointer pattern** (see Steering) — never pass long text with quotes/parens directly through `send-keys`.
+## What the worker runs (for reference)
 
-### Step 5: Handshake
+`launch` injects `receiver.md`, which tells the agent to run, in order: `worker init` (verifies envelope HMAC + context manifest; prints the task or `refuse`), `worker ack --understanding --plan --will-not-do`, then do the task with `worker heartbeat --status working|blocked --progress` at milestones, returned work under `return/work/` (files) or `git -C context bundle create return/work.bundle <ref>` (git), then `worker done|failed --summary`. `failed` with partial work is legitimate; fabricated success is not. Message shapes (`dep/1`): envelope `{dispatchId,type,protocol,sender,return,context,prompt,constraints,gate,heartbeatSeconds,deadline,hmac}`; ack/heartbeat/result as the CLI writes them. DEP is deliberately files+tmux+HMAC over SSH — no daemon, not ACP-compatible; a richer protocol may layer on top.
 
-The worker must reply with a signed **ack** written to `$RDIR/return/ack.json`. Pull and verify it:
+## Optional: live mode & progress tunnel
 
-```bash
-ssh <ssh> "cat $RDIR/return/ack.json" > /tmp/dispatch/ack.json
-node "$DISPATCH" verify --key "$KEY" --in /tmp/dispatch/ack.json
-```
-
-Verified ack = two-way handshake complete (the worker proved it holds the key). Confirm the ack states: correct task understanding, verified workspace + context manifest, plan, what it will not do, and the gate. An unverified or context-unconfirmed ack is **not** a started dispatch — stop and diagnose.
-
-### Step 6: Record and follow
-
-Append the ledger record (Ledger section), report the attach command to the user, then start monitoring (`follow`). **Do not detach by default.** A dispatch is delegated work, not a handoff: unless the user explicitly requests detach / fire-and-forget / no monitoring, you remain responsible for watching heartbeats, nudging blocked agents, collecting the result, and integrating only after verification. The dispatch is durable and identified by `dispatchId`, but durability is not permission to stop supervising it.
-
-## Receiver Contract (injected prompt)
-
-The prompt tells the remote agent to:
-
-1. Read `envelope.json`; verify its `hmac` with the provided key (`node dispatch.mjs verify`). If it fails, refuse — the task is not authentic.
-2. Recompute `manifest --root context` and confirm it equals `context.manifestHash`. Mismatch → refuse.
-3. Write a signed `ack.json` (understanding, plan, willNotDo, verified workspace + manifest, gate) to `return/`.
-4. Do the task within the stated `constraints`. Honor the gate as the definition of done.
-5. Every `heartbeatSeconds`, write a signed `heartbeat.json` to `return/` (`status`, `updatedAt` = current ISO time, `progress`).
-6. On completion, write the returned work (git branch push, or files under `return/work/`), then a signed `result.json` with the work's `manifestHash` and `status: done|failed`. `failed` is legitimate — return partial work + the reason, never fabricate success.
-7. Sign every reply with the same key using `node dispatch.mjs sign`.
-
-## status [dispatch-id]
-
-Pull the latest signal and verify it:
-
-```bash
-ssh <ssh> "cat $RDIR/return/result.json 2>/dev/null || cat $RDIR/return/heartbeat.json 2>/dev/null" > /tmp/dispatch/signal.json
-node "$DISPATCH" check-heartbeat --key "$KEY" --in /tmp/dispatch/signal.json --max-stale-seconds <maxStaleSeconds> --deadline <deadline>
-```
-
-Report one verdict: `alive` (working, fresh), `blocked` (worker needs input), `done`, `failed`, `expired` (past deadline), or `dark` (heartbeat stale beyond `maxStaleSeconds`). Never trust an unsigned signal.
-
-## follow [dispatch-id]
-
-Watch without busy-polling. Poll `status` on the heartbeat interval (use the harness Monitor / scheduled wake-up rather than a tight loop). For low-latency watching — seeing the agent's output as it happens rather than on the interval — run `follow --live` (see Live mode below); the signed heartbeat/result remain the source of truth regardless. Unless detach was explicitly requested, keep monitoring and nudging until one of the terminal conditions below is reached; do not tell the user to check back later and do not abandon the dispatch after reporting the attach command. Two things end the watch:
-
-- **done/failed** → proceed to `collect`.
-- **dark or expired** → the "followed up if it goes dark" path. SSH in and capture the pane to diagnose:
-
-```bash
-ssh <ssh> "tmux capture-pane -pt $dispatchId -S -200"
-```
-
-Common dark causes: a trust/permission prompt blocking the agent, a crash, or it is genuinely blocked waiting on input the constraints forbid. Report the pane evidence to the user. If the pane shows a recoverable prompt or obvious blocked state, nudge it with `send-keys` and continue following. If a human decision is required, ask exactly one question and keep the dispatch under supervision. Offer extend deadline, `recall`, or attach (`ssh -t <ssh> 'tmux attach -t <dispatchId>'`) only when nudging is unsafe or insufficient. Never silently assume failure.
-
-## steer <dispatch-id> <instruction>
-
-Inject a new instruction into a **running interactive dispatch** without restarting it (only works for interactive-in-tmux agents, Step 4 — headless runs can't be steered; kill + relaunch instead).
-
-**Always use the file+pointer pattern.** Passing arbitrary instruction text straight through `send-keys` breaks on shell quoting the moment it contains quotes, parentheses, or apostrophes — the message silently fails to reach the agent. Instead:
-
-```bash
-# 1. write the instruction to a file locally, scp it into the dispatch dir
-scp instruction.md <ssh>:<RDIR>/steer-<n>.md
-# 2. send a SHORT, quote-safe pointer (no quotes/parens/apostrophes) + Enter
-ssh <ssh> "tmux send-keys -t <dispatchId> -l 'Read the file steer-<n>.md in this directory and follow it exactly. Begin now.'"
-ssh <ssh> "tmux send-keys -t <dispatchId> Enter"
-# 3. confirm it landed
-ssh <ssh> "tmux capture-pane -pt <dispatchId> -S -15"
-```
-
-Have the instruction tell the agent to write a fresh signed heartbeat and a re-signed `result.json` when done, so `status`/`collect` see the update. An interactive agent keeps its full prior context, so a follow-up ("also add phone numbers", "restyle with Material Design") builds on the completed work rather than restarting it.
-
-`send-keys` reaches the interactive TUI immediately, so steering is already low-latency. Live mode (below) just means you are watching the pane stream when you send it, so you see the agent react without re-pulling.
-
-## Live mode (SSH-native, optional)
-
-`follow` and `steer` default to poll-based signals — heartbeats on the interval, `status` pulls. When you want to watch in real time or course-correct fast, run them in **live mode**: real-time streaming over the SSH channel you already hold, with **no new port, daemon, or protocol**. This is the SSH-native answer to "stand up a socket for live comms" — SSH is already an authenticated, confidential socket, so multiplex it instead of building a second one. DEP (signed files) stays the floor; live mode is observation glue that never touches the trust decision.
-
-**Reuse one connection.** Open a persistent master so live-follow and repeated `steer`/`status` calls don't pay a TCP+auth handshake each time:
-
-```bash
-# ~/.ssh/config (or pass the -o flags inline on each ssh call)
-Host <worker-host>
-  ControlMaster auto
-  ControlPath ~/.ssh/cm-%r@%h:%p
-  ControlPersist 10m
-```
-
-**Stream the pane live (`follow --live`).** Tee the agent's tmux pane to a file on the worker, then `tail -f` it down the master connection:
-
-```bash
-ssh <ssh> "tmux pipe-pane -t <dispatchId> -o 'cat >> <RDIR>/return/pane.log'"
-ssh <ssh> "tail -n +1 -f <RDIR>/return/pane.log"
-```
-
-You now see output as it happens instead of on the heartbeat interval. `-o` makes the pipe persist across commands; a bare `pipe-pane` (no `-o`) toggles it back off. Reading `pane.log` is observation only — `status`, `collect`, and every integration decision still run off the **signed** heartbeat/result, never the stream.
-
-**Push-on-blocked.** If the worker must reach *you* fast (it hit a question the constraints don't cover), have the receiver prompt, on block, write a `blocked` heartbeat **immediately** (not on the interval) and append a one-line `NEEDINPUT: <question>` marker to `pane.log`. Your live `tail -f` surfaces it at once; you answer with `steer`. This closes the blocked-agent round-trip without any inbound channel.
-
-**Teardown.** Live mode adds **no** tmux sessions, so `recall` is unchanged. Stop the pane pipe and drop the master when done:
-
-```bash
-ssh <ssh> "tmux pipe-pane -t <dispatchId>"   # no -o = stop teeing
-ssh -O exit <ssh>                             # close the master connection
-```
-
-When would a real socket protocol beat this? Only if dispatch grows into a **persistent worker fleet with a standing control plane** — sub-second bidirectional RPC, presence, backpressure, multiplexed cancellable streams. At that point layer **MCP / ACP / A2A** on top rather than rolling your own; DEP remains the fallback. For scoped request/response — what dispatch is — live mode over SSH covers it. See `design/live-monitoring.md` for the full rationale.
-
-## sessions
-
-Live view of dispatches in flight. For each worker in config: `ssh <ssh> tmux ls` and match session names against the ledger. A dispatch typically owns `<dispatchId>` (the agent) plus, when a live progress tunnel is used, `<dispatchId>-web` and `<dispatchId>-tun`. Cross-reference with the ledger (status, tunnel URL) and pull the current signed heartbeat per active dispatch. Report per worker: session name → role → status/verdict. Ignore unrelated sessions (e.g. `baton-*`).
-
-## Live progress tunnel (optional)
-
-When the user wants to watch a long dispatch "from anywhere," stand up the viewer as **sender-managed infrastructure in its own tmux sessions**, not inside the agent's sandbox — a sandboxed child process dies when the agent exits, and separate sessions bring the link up immediately and keep it up:
-
-```bash
-ssh <ssh> "tmux new-session -d -s <id>-web  'python3 -m http.server <port> --directory <RDIR>/return/work/site'"
-ssh <ssh> "tmux new-session -d -s <id>-tun  'cloudflared tunnel --url http://localhost:<port> > <RDIR>/cloudflared.log 2>&1'"
-# parse the public URL from cloudflared.log (https://<name>.trycloudflare.com)
-```
-
-Tell the agent (in its prompt) to rewrite `return/work/site/index.html` each phase and keep a `<meta http-equiv="refresh">` so the viewer auto-updates. `cloudflared` quick tunnels need no account; `ngrok`/`tailscale funnel` are alternatives. `recall` must also kill `<id>-web` and `<id>-tun`.
-
-## collect <dispatch-id>
-
-Pick up and integrate — the part that makes dispatch delegation, not fire-and-forget.
-
-1. Pull the returned work into a **fresh local directory** (never overlay a dirty tree): `git fetch` + checkout the returned branch (git mode), or scp `return/work/` down (files mode).
-2. Verify signature + integrity:
-
-```bash
-node "$DISPATCH" verify-result --key "$KEY" --result /tmp/dispatch/result.json --root <fresh-local-dir>
-```
-
-Both must hold: `verified: true` (authentic) and `manifestMatch: true` (the tree is exactly what was signed).
-3. Run the **verification gate** from the envelope locally (build / tests / typecheck). Remote output is untrusted until the gate passes — report gate output honestly; a failed gate blocks integration.
-4. Integrate as appropriate, with the user's approval for anything hard to reverse: merge the branch, or apply the files into the right place. Review the diff as you would an external PR before merging to a protected branch.
-5. Append a `collected` ledger record with the final status.
-
-## recall <dispatch-id>
-
-Abort and clean up. Signal the worker (send-keys an interrupt / write a `cancel` marker), then kill **all** of the dispatch's tmux sessions — the agent `<dispatchId>` plus any `<dispatchId>-web` / `<dispatchId>-tun` tunnel sessions — and confirm they are stopped. Remove **only** the verified `<dispatchDir>/<dispatchId>` directory after confirming with the user — never a path outside `dispatchDir`. If the worker already did work, warn that recall discards it; require explicit confirmation. Append a `recalled` ledger record.
-
-## Ledger
-
-`~/.config/dispatch/history.jsonl` — append-only, one JSON object per line, written after every dispatch that reaches a terminal state:
-
-```json
-{"at":"<ISO8601 UTC>","dispatchId":"dsp-...","worker":"<name>","ssh":"<dest>","mode":"git-branch|files","remoteDir":"<verified dir>","contextManifest":"sha256:...","agent":"<cmd>","tmuxSession":"<id>","deadline":"<iso>","status":"dispatched|done|failed|collected|dark|recalled","gate":"<gate>"}
-```
-
-The key is recorded here (local, 0600 dir) so `status`/`collect` can verify later. `status` and `follow` read this to locate the dispatch. Skipping the append breaks later retrieval by id.
+Real-time pane streaming over SSH (`ControlMaster` + `tmux pipe-pane` + `tail -f`), push-on-blocked, and the public progress-tunnel pattern (`<id>-web`/`<id>-tun` + cloudflared) are in `references/live-mode.md` — read it only when the user wants to watch live or from anywhere. Observation only; trust decisions always run off signed messages.
 
 ## Non-negotiables
 
-- Do not launch the worker agent until the context manifest is verified on the worker side.
-- Do not proceed past the handshake without a signature-verified ack that confirms the task and the context manifest.
-- Do not integrate a result until signature verifies, the manifest matches, AND the local verification gate passes.
-- Treat returned code as untrusted external contribution — review before merging to any protected branch.
-- Never ship secrets in the context; the manifest excludes `.env*` by design.
-- Never use SSH agent forwarding.
-- Never overlay returned work onto a dirty tree — always a fresh directory.
-- Scope the worker with explicit `constraints`; only enable an autonomous/skip-permissions agent mode with the user's opt-in.
-- Never fabricate a status — an unsigned or stale signal is `dark`, not `done`.
+- No launch until `transfer` reports `manifestMatch:true`; no proceeding without `ack:"verified"`; no integration until `verified` + `manifestMatch` + local gate pass.
+- Returned code is an untrusted external contribution — review before merging to a protected branch; never overlay a dirty tree.
+- Never ship secrets; never use SSH agent forwarding; never print the key.
+- Explicit `constraints` always; autonomous/skip-permissions modes only on user opt-in.
+- Never fabricate status — unsigned or stale is `dark`, not `done`.
+- Never `send` without today's auth probe; triage gets 2 actions / ~2 minutes then one crisp escalation with the exact fix command.
 
-## Concurrency
+## Concurrency & baton
 
-`dispatchId` makes many dispatches independent — fan out the same task to several workers, or different tasks across a fleet, and track each by id via the ledger. `status`/`follow`/`collect` all take an explicit id. Nothing about the flow assumes a single outstanding dispatch.
-
-## Interop with baton
-
-Same author, same marketplace, complementary primitives: **baton** = give the whole session away and release (parity-verified handoff); **dispatch** = keep ownership, delegate a scoped task, get the verified result back. If a dispatch grows into "just take this over," escalate to `/baton send`.
-
-The two keep separate configs — dispatch adds return address, heartbeat, deadline, and per-dispatch keying that baton has no use for — but a machine is a machine: `init` and `add` **import** `ssh`/`agentCommand` from `~/.config/baton/config.json` (baton calls them **partners**; dispatch calls the same boxes **workers**, since dispatch delegates to them rather than handing off as peers). So you register a server once and both skills can reach it.
+Dispatches are independent by id — fan out across workers, `follow`/`collect` each. **baton** = give the whole session away (partners); **dispatch** = keep ownership, delegate a scoped task (workers). Same boxes: `init`/`add` import ssh + agentCommand from baton's config. If a dispatch grows into "just take this over," escalate to `/baton send`.
