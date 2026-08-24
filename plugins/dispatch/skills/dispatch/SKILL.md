@@ -1,139 +1,149 @@
 ---
 name: dispatch
 description: >-
-  Use this skill whenever the user asks to dispatch, delegate, farm out, or send
-  a task to a remote agent on another server and get the result back — not a
-  full session handoff (that is baton), but a scoped request/response where you
-  stay the orchestrator. It negotiates SSH, discovers which agent CLIs exist on
-  the worker (claude, opencode, codex, gemini, aider, goose, ...), packages a
-  right-sized prompt + context, mints a per-dispatch key so every message is
-  HMAC-signed, launches the remote agent in tmux under an envelope protocol,
-  then monitors it and integrates the verified result. Trigger on phrases like
-  dispatch this to <host>, send this task to the build box, delegate to the
-  remote agent, farm this out, offload to <server>, remote agent job. Also
-  handles worker management, live steering of a running dispatch, and session
-  listing: dispatch init, add, list, remove, default, check, enable, disable,
-  steer, and sessions.
+  Use this skill when the user asks to dispatch, delegate, farm out, or send a
+  scoped task to a remote agent, or to hand off, pass, or continue a task,
+  session, repository, or workspace on another machine. Default dispatch keeps
+  the sender as orchestrator and returns verified work. `send --pass` transfers
+  full ownership after file parity and receiver acknowledgment. It also handles
+  worker setup, status, steering, collection, recall, and session history.
 ---
 
 # Dispatch
 
-Delegation, not handoff. You send a scoped task to a remote agent, monitor it, and **you** pick the verified result back up and integrate it. Baton gives the session away; dispatch keeps you as orchestrator.
+One transport, two ownership modes:
 
-> Authenticated handshake first. Right-sized context second. Signed heartbeats throughout. Verified result before integration. Never integrate unverified or untested remote output.
+- `/dispatch send [worker]` delegates a scoped task. The sender supervises, verifies the result, and integrates it.
+- `/dispatch send [worker] --pass` hands over the task and workspace. The receiver owns the live session after the sender accepts its signed acknowledgment.
 
-**Everything mechanical is the CLI.** `scripts/dispatch.mjs` (next to this file; node stdlib, zero deps) runs on both sides: sender commands own the ssh calls and resolve everything from the ledger by `dispatchId`; the worker runs `worker <sub>` inside its dispatch dir. Your judgment belongs in exactly four places — **which context, the prompt, constraints + gate, and run mode**. Do not re-derive, hand-assemble, or "design" keys, envelopes, signatures, hashes, ssh/tmux/scp incantations, or heartbeat JSON — call the command. Every command prints JSON with a `next` hint; exit code 0/1 = pass/fail.
+The invariant is:
+
+> Authenticate first. Verify file parity second. Launch third. Acknowledge fourth. Release or collect last.
+
+`scripts/dispatch.mjs` next to this file owns the mechanical work on both machines. It creates signed envelopes, transfers context, checks manifests, launches tmux, records heartbeats, and resolves state from a ledger. Use it instead of hand-assembling SSH, SCP, tmux, HMAC, or manifest commands.
 
 ```bash
-DISPATCH="<directory containing this SKILL.md>/scripts/dispatch.mjs"   # never assume the user's cwd
-node "$DISPATCH"            # usage
+DISPATCH="<directory containing this SKILL.md>/scripts/dispatch.mjs"
+node "$DISPATCH"
 ```
+
+Every command prints JSON with a `next` field when another mechanical step exists. Exit code 0 means the command's invariant passed.
 
 ## Trust model
 
-- **SSH is the trust bootstrap.** The per-dispatch key (HMAC-SHA256, 32 random bytes) travels only inside the SSH channel (`transfer` writes it to `<remoteDir>/key`, mode 0600).
-- **The key signs every leg after that**: envelope, ack, heartbeats, result. The receiver proves it holds the key by signing its ack (two-way handshake). Any tamper or keyless party fails verification.
-- **Integrity is content-addressed.** Context and returned work are fingerprinted (canonical manifest hash) inside signed messages.
-- **Remote output is untrusted until**: signature valid + manifest matches + your local gate passes. Treat returned code like a stranger's PR.
+- SSH bootstraps trust. `transfer` writes a 32-byte HMAC key to the receiver inside that channel with mode 0600.
+- The key signs the envelope, acknowledgment, heartbeat, and result. A receiver acknowledgment proves possession of the key and confirms the context manifest.
+- Default delegation treats returned work as an external contribution until its signature, manifest, local gate, and diff all pass.
+- Pass mode transfers ownership only after `release` re-verifies the latest acknowledgment and confirms the tmux session is alive.
+- Prompt files and workspace files transfer. Process memory, hidden model state, shell state, credentials, and unrecorded decisions do not.
 
-## Commands (`/dispatch <cmd>`)
+## Commands
 
-Dispatch on the first token. No command: no config → `init`; the conversation is delegating a task → `send`; else `list`.
+Dispatch on the first token. With no command, run `init` when no config exists, infer `send` only when the conversation clearly requests remote work, otherwise run `list`.
 
-| command | what you do |
+| command | action |
 | --- | --- |
-| `init` | first-run: import workers from `~/.config/baton/config.json` (ssh + agentCommand only, never secrets) or run `add`; `check` each; set default if exactly one; offer fleet mode (default off); report |
-| `add [name]` | collect `ssh` (only required input), `dispatchDir` (`~/dispatch-inbox`), `heartbeatSeconds` 300, `maxStaleSeconds` 900, `deadlineMinutes` 60; `node "$DISPATCH" discover <name>` → user picks `agentCommand` (propose if exactly one; never silently substitute); merge into config (first worker = default); run `check` |
-| `list` / `remove <name>` / `default <name>` | edit `~/.config/dispatch/config.json` read-modify-write, preserve unknown fields; `remove` confirms; unknown name errors |
-| `check [name]` | `node "$DISPATCH" check [name]` — reachable, node ≥ 20, tmux, agent binary, **auth probe**. If `auth` ≠ `ok`: give the user the printed `fix` command verbatim, wait for "done", re-run once. Never attempt an OAuth/device-code login yourself |
-| `send [name]` | the Send flow below |
-| `status` / `follow` / `steer` / `collect` / `recall` / `sessions` / `history` | `node "$DISPATCH" <cmd> <id> ...` — see below |
-| `enable` / `disable` / `mode` | `set-mode --available true|false [--interval-minutes N]` / `mode` (Fleet mode) |
+| `init` | Import `ssh` and agent commands from legacy `~/.config/baton/config.json` when present, or run `add`. Never import secrets. Check each worker and offer fleet mode, which defaults off. |
+| `add [name]` | Collect `ssh`, `dispatchDir` defaulting to `~/dispatch-inbox`, heartbeat and deadline settings. Run `discover`; let the user choose an agent command. Add without replacing unknown config fields, then run `check`. |
+| `list`, `remove`, `default` | Read or edit `~/.config/dispatch/config.json`. Confirm removal and preserve unknown fields. |
+| `check [name]` | Run `node "$DISPATCH" check [name]`. Report reachability, Node, tmux, agent binary, and auth. Give the printed login fix to the user when auth fails. Do not perform OAuth or device login for them. |
+| `send [name]` | Run the shared send flow below and retain sender ownership. |
+| `send [name] --pass` | Run the shared flow, then the pass-mode release in [references/pass-mode.md](references/pass-mode.md). |
+| `status`, `follow`, `steer`, `collect`, `recall`, `sessions`, `history` | Run the matching CLI command by dispatch ID. |
+| `enable`, `disable`, `mode` | Manage fleet reminders with `set-mode` and `mode`. |
 
 Config shape: `{ "defaultWorker": "w", "workers": { "w": { "ssh": "user@host", "dispatchDir": "~/dispatch-inbox", "agentCommand": "codex", "heartbeatSeconds": 300, "maxStaleSeconds": 900, "deadlineMinutes": 60, "lastAuthOkAt": null } } }`. Never invent a worker.
 
-## Fleet mode
+## Shared send flow
 
-`enable`/`disable` set whether you should *proactively* offer to offload work. It is a `UserPromptSubmit` hook (`hooks/hooks.json` → `reminder-check`) because a standing disposition must fire on future turns regardless of what the user typed. The nudge prints only when `mode.json` has `available: true` AND `reminderIntervalMinutes` (30) has elapsed; otherwise nothing. It asks you to propose `/dispatch send` when a task would tie up the local screen/simulator, eat heavy CPU/RAM/IO, run long, or parallelize across machines — never forces it. Separate from the plugin's own enabled state (`/plugin` menu, a harness operation).
+### 0. Worker and auth
 
-## Send flow
+Pick the explicit worker, then `defaultWorker`. Run `check` first unless `lastAuthOkAt` is from today. A signed-out agent discovered after transfer wastes the run.
 
-**0. Worker + auth.** Pick the worker (explicit name > `defaultWorker`). If `lastAuthOkAt` is not today, run `check` first — a signed-out CLI discovered after transfer+launch wastes the whole budget.
+### 1. Context and prompt
 
-**1. Right-size the context (judgment).** No more or less than the task needs.
-- In a git repo, **a branch/bundle is the default, not an archive** — the return leg becomes a merge with provenance. Uncommitted state → ask the user to commit for dispatch (ask; don't fall back to files). Worker can reach the remote (`ssh <ssh> git ls-remote <url> HEAD`)? push `dispatch/<slug>` and use `transfer --branch --repo-url`; else `git bundle create ctx.bundle <ref>` and `transfer --bundle`. In both cases `prepare --root` is the checkout and `--ref` is the branch.
-- Non-repo or standalone tasks: curated `--paths-file` (files mode).
-- Secrets never ship (`.env*` excluded by the manifest; report `excludedSensitive`). Needed credentials go out-of-band via the user.
-- Write the **prompt as a file**: goal, exact next step, definition of done, the gate. Reference context by path.
+Choose the ownership mode before packaging context.
 
-**2. Prepare.**
+- Default delegation gets only the files and instructions needed for the scoped task.
+- Pass mode gets the complete useful workspace and a written session packet. Read [references/pass-mode.md](references/pass-mode.md) before preparing it.
+
+For a git repository, prefer a pushed `dispatch/<slug>` branch when the worker can reach its remote. Otherwise create a git bundle from a committed ref. Ask before committing uncommitted work. If a pass must include uncommitted state and the user declines a commit, use full-tree files mode and state that the receiver will not get git history.
+
+Use curated files mode for non-repository work. `.env*` files never ship. Report excluded sensitive paths and arrange credentials through the user.
+
+Write the task or handoff packet to a prompt file. Include the goal, exact next step, definition of done, verification gate, and explicit constraints.
+
+### 2. Prepare
+
 ```bash
-node "$DISPATCH" prepare --worker <name> --root <ctx-root> [--paths-file <f>] --prompt-file <f> \
-  --gate "<how you will verify>" --constraints "do not force-push;do not touch main" [--ref dispatch/<slug>] --out-dir /tmp/dispatch/<slug>
+node "$DISPATCH" prepare --worker <name> --root <context-root> \
+  [--paths-file <file>] --prompt-file <file> \
+  --gate "<observable verification>" \
+  --constraints "do not force-push;do not touch main" \
+  [--ref dispatch/<slug>] [--pass] --out-dir /tmp/dispatch/<slug>
 ```
-Worker defaults come from config; `--heartbeat-seconds/--max-stale-seconds/--deadline-minutes` override. Prints `dispatchId`; from here every command takes that id.
 
-**3. Transfer.** `node "$DISPATCH" transfer <id> [--bundle <f> | --branch <ref> --repo-url <url>]` — ships script + envelope + key, places the context, and has the worker recompute the manifest. `manifestMatch:false` → **do not launch**; fix and re-run.
+`--pass` is a bare boolean flag. It records receiver ownership in the signed envelope and ledger. Keep explicit constraints in both modes.
 
-**4. Launch (judgment: run mode).** `node "$DISPATCH" launch <id> --agent "<cmd>" --mode interactive|headless`
-- **interactive** (default; long-running or steerable work): the TUI in tmux; the only mode you can re-steer mid-run with full context kept.
-- **headless** (fire-and-forget only, fully specified short tasks): `claude -p`, `codex exec -s workspace-write --skip-git-repo-check` — no live input channel.
-- Proven agent commands: codex interactive+autonomous `codex -s workspace-write -a never` (add `-c sandbox_workspace_write.network_access=true --search` if the task needs network); claude `claude` / `claude -p`; `--dangerously-skip-permissions` or codex `-a never` only with the user's opt-in for an autonomous run.
-- `launch` starts an `agent` window and a `pulse` window (re-signs heartbeats every `heartbeatSeconds` so liveness costs the agent no tokens; `--pulse false` to disable), auto-dismisses known interstitials (codex self-update → Skip, trust-this-directory → Yes), then injects the receiver prompt via file+pointer. It returns the `attach` command — give it to the user.
+### 3. Transfer
 
-**5. Handshake.** `node "$DISPATCH" await-ack <id>` (timebox 120s, polls every 20s). `ack:"verified"` = the worker proved it holds the key and confirmed the context; read its `understanding`/`plan`/`willNotDo` — if they are wrong, `steer` a correction. `ack:"none"` → the output includes the pane; go to Triage. An unverified ack is **not** a started dispatch.
+Run `node "$DISPATCH" transfer <id> [--bundle <file> | --branch <ref> --repo-url <url>]`. With neither option it transfers the prepared file set. Stop on `manifestMatch:false`; launch is forbidden until the receiver recomputes the expected manifest.
 
-**6. Follow.** `node "$DISPATCH" follow <id>` (run in the background with a Bash `run_in_background`, or poll `status <id>` on a Monitor/scheduled wake-up — never a tight loop). Report the attach command, then **stay on it**: unless the user explicitly asked for fire-and-forget, you keep supervising until a terminal verdict, nudge blocked agents, and collect. Durability by id is not permission to stop.
+### 4. Launch
 
-## Verdicts (`status` / `follow`)
+Run `node "$DISPATCH" launch <id> --agent "<command>" --mode interactive|headless`.
 
-`alive` (fresh, progressing) · `idle` (pulse fresh but no progress report in `maxStaleSeconds` — nudge with `steer` if it persists) · `blocked` (agent asked a question: read `progress`, answer via `steer`) · `done` / `failed` → `collect` · `dark` (no signed signal in `maxStaleSeconds`) / `expired` (deadline) / `no-signal` (nothing yet) / `unverified` (bad signature — treat as dark, never as done). Any non-alive verdict includes the pane (or `agent.log` tail for headless) so triage is one call. `follow` exits on the first verdict that needs you.
+- Interactive is the default for steerable work and is mandatory for `--pass`.
+- Headless is only for a short, complete, fire-and-forget delegation.
+- Autonomous or permission-bypass agent flags require the user's opt-in.
 
-## Triage (fast-fail, hard budget)
+The command launches an `agent` tmux window and a `pulse` window, clears known startup interstitials, injects `receiver.md`, and returns an attach command. Give that command to the user.
 
-**2 diagnostic actions or ~2 minutes, then escalate to the human.** A whole successful dispatch takes ~5 minutes; ten minutes of solo debugging has already failed. Read the pane from `await-ack`/`status`/`node "$DISPATCH" pane <id>` and act:
+### 5. Verify acknowledgment
 
-| pane shows | action |
+Run `node "$DISPATCH" await-ack <id>`. It polls for up to 120 seconds by default. An unverified or incomplete acknowledgment is not a started dispatch.
+
+- Default delegation: inspect `understanding`, `plan`, and `willNotDo`, correct them with `steer` when needed, then supervise with `follow`.
+- Pass mode: inspect the stronger acknowledgment and continue with [references/pass-mode.md](references/pass-mode.md). Do not release automatically.
+
+## Default delegation lifecycle
+
+Run `follow <id>` in the background or poll `status <id>` through a monitor. Stay responsible until a terminal verdict unless the user asked for detached work.
+
+Verdicts are `alive`, `idle`, `blocked`, `done`, `failed`, `dark`, `expired`, `no-signal`, and `unverified`. Nudge a persistently idle agent. Answer a blocked agent through `steer`. Treat unsigned or stale state as unknown, not success.
+
+`collect <id> --into <fresh-empty-dir>` pulls returned work and verifies its signature and manifest. Run the printed gate locally, review the diff, then integrate only with the user's approval for hard-to-reverse changes. Mark the dispatch collected after integration.
+
+## Triage
+
+Use at most two diagnostic actions or about two minutes before escalating with the pane excerpt and exact fix.
+
+| pane state | response |
 | --- | --- |
-| login URL, device code, "not logged in", 401, invalid API key | **escalate now**: one message — what's wrong, the exact fix (`node "$DISPATCH" check` prints it), what you'll do when they say done. Never run the login flow yourself |
-| a y/n or menu prompt the launcher didn't catch | `steer <id> --keys "<tmux keys>"` with the safe answer if constraints allow (e.g. `--keys "2 Enter"`); else ask the user one question |
-| shell prompt / "command not found" / `[dispatch] agent exited with status N` | agent crashed or never started: re-check `--agent` (`discover`), one relaunch (`launch <id>` again — dir, envelope, context all survive; never re-transfer to recover) |
-| agent visibly working, no ack | `steer <id> --file` a one-line pointer to re-run `node dispatch.mjs worker init` then `worker ack` |
-| anything else | escalate with the pane excerpt |
+| login prompt, device code, 401, or invalid key | Give the user the `check` command's login fix. Wait for them to finish login. |
+| safe menu or confirmation prompt | Use `steer --keys` with the safe selection. Ask when the answer changes scope or permissions. |
+| agent missing or exited | Re-run discovery and attempt one launch. Do not re-transfer intact context. |
+| agent working without acknowledgment | Steer a short instruction to run `worker init` and `worker ack`. |
+| anything else | Escalate with evidence. |
 
-Offer extend deadline / `recall` / attach only when nudging is unsafe or insufficient. Never silently assume failure.
+## Status, steering, recall, and history
 
-## steer <id>
+- `steer <id> --file <instruction.md>` transfers a file and sends a quote-safe pointer. `--keys` sends literal tmux keys. Headless runs cannot be steered.
+- `recall <id> [--purge true]` stops the sessions. Purge only after warning about discarded work. A released pass also requires explicit `--force`, because the receiver owns its files.
+- `sessions` cross-references remote `dsp-*` tmux sessions with the ledger.
+- `history` merges the append-only `~/.config/dispatch/history.jsonl` without printing its stored HMAC keys.
 
-`node "$DISPATCH" steer <id> --file <instruction.md>` — scp's the file in and sends a short quote-safe pointer (raw text through `send-keys` breaks on quotes; the CLI never does that). Interactive agents keep their context, so follow-ups build on completed work. Tell the instruction to end with `worker heartbeat`/`worker done` so the result is re-signed. `--keys "<tmux keys>"` sends literal keys (`C-c`, `2 Enter`). Headless runs cannot be steered — recall + relaunch.
+## Fleet mode and live observation
 
-## collect <id>
+Fleet mode is an optional reminder hook. It proposes dispatch for work that ties up a local GUI, consumes heavy resources, runs long, or parallelizes cleanly. It never forces offloading.
 
-`node "$DISPATCH" collect <id> --into <fresh-empty-dir>` — pulls the work (bundle → `git clone`, or files), verifies **signature AND manifest** (`verified:true`, `manifestMatch:true`; anything else blocks integration). Then **you** run the gate from the output locally, report its result honestly, review the diff as an external PR, integrate with the user's approval for anything hard to reverse (never overlay a dirty tree), and `node "$DISPATCH" mark <id> --status collected`.
-
-## recall / sessions / history
-
-- `recall <id> [--purge true]` — interrupts the agent, kills `<id>`, `<id>-web`, `<id>-tun`; `--purge` removes only the verified dispatch dir. If work exists, warn it is discarded and require explicit confirmation before purging.
-- `sessions` — per worker: live `dsp-*` tmux sessions cross-referenced with the ledger (`unknown` = not in your ledger; stale `dispatched` past deadline = candidates for `recall`).
-- `history` — merged ledger (`~/.config/dispatch/history.jsonl`, append-only; the key lives there so status/collect work later — never print it).
-
-## What the worker runs (for reference)
-
-`launch` injects `receiver.md`, which tells the agent to run, in order: `worker init` (verifies envelope HMAC + context manifest; prints the task or `refuse`), `worker ack --understanding --plan --will-not-do`, then do the task with `worker heartbeat --status working|blocked --progress` at milestones, returned work under `return/work/` (files) or `git -C context bundle create return/work.bundle <ref>` (git), then `worker done|failed --summary`. `failed` with partial work is legitimate; fabricated success is not. Message shapes (`dep/1`): envelope `{dispatchId,type,protocol,sender,return,context,prompt,constraints,gate,heartbeatSeconds,deadline,hmac}`; ack/heartbeat/result as the CLI writes them. DEP is deliberately files+tmux+HMAC over SSH — no daemon, not ACP-compatible; a richer protocol may layer on top.
-
-## Optional: live mode & progress tunnel
-
-Real-time pane streaming over SSH (`ControlMaster` + `tmux pipe-pane` + `tail -f`), push-on-blocked, and the public progress-tunnel pattern (`<id>-web`/`<id>-tun` + cloudflared) are in `references/live-mode.md` — read it only when the user wants to watch live or from anywhere. Observation only; trust decisions always run off signed messages.
+For pane streaming and public progress tunnels, read [references/live-mode.md](references/live-mode.md) only when the user asks to observe the run live. Streams are observational. Trust decisions still use signed files.
 
 ## Non-negotiables
 
-- No launch until `transfer` reports `manifestMatch:true`; no proceeding without `ack:"verified"`; no integration until `verified` + `manifestMatch` + local gate pass.
-- Returned code is an untrusted external contribution — review before merging to a protected branch; never overlay a dirty tree.
-- Never ship secrets; never use SSH agent forwarding; never print the key.
-- Explicit `constraints` always; autonomous/skip-permissions modes only on user opt-in.
-- Never fabricate status — unsigned or stale is `dark`, not `done`.
-- Never `send` without today's auth probe; triage gets 2 actions / ~2 minutes then one crisp escalation with the exact fix command.
-
-## Concurrency & baton
-
-Dispatches are independent by id — fan out across workers, `follow`/`collect` each. **baton** = give the whole session away (partners); **dispatch** = keep ownership, delegate a scoped task (workers). Same boxes: `init`/`add` import ssh + agentCommand from baton's config. If a dispatch grows into "just take this over," escalate to `/baton send`.
+- File parity precedes launch. Verified acknowledgment precedes delegation or release.
+- Default delegation requires a verified return and local gate before integration.
+- Pass mode requires an interactive receiver, an exact next step, the same gate, readiness `ready`, and an explicit `release` command.
+- After release, the sender stops following, steering, and collecting. A return is a new passed dispatch in the opposite direction.
+- Never ship secrets, forward an SSH agent, print the HMAC key, fabricate status, merge unverified work, or overwrite a dirty workspace.
+- Dispatch IDs are independent, so scoped delegations may run concurrently. Each passed dispatch has exactly one owner.

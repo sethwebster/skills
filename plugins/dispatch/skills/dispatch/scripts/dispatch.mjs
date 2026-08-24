@@ -10,7 +10,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, write
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 
-const configDir = join(homedir(), '.config', 'dispatch')
+const configDir = resolve(process.env.DISPATCH_CONFIG_DIR ?? join(homedir(), '.config', 'dispatch'))
 const configPath = join(configDir, 'config.json')
 const ledgerPath = join(configDir, 'history.jsonl')
 const defaultModeState = join(configDir, 'mode.json')
@@ -53,6 +53,7 @@ function main() {
     case 'transfer': return exitJson(transfer(id(), options))
     case 'launch': return printJson(launch(id(), options))
     case 'await-ack': return exitJson(awaitAck(id(), options))
+    case 'release': return exitJson(release(id()))
     case 'status': return exitJson(status(id(), options))
     case 'follow': return follow(id(), options)
     case 'pane': return process.stdout.write(pane(ledgerFor(id()), Number(options.get('lines') ?? 200)))
@@ -231,7 +232,9 @@ function prepare(options) {
   const ssh = options.get('ssh') ?? w.ssh
   if (!ssh) throw new Error('Missing --ssh (or --worker <name> with ssh in config)')
   const dispatchDir = options.get('dispatch-dir') ?? w.dispatchDir ?? '~/dispatch-inbox'
-  const method = options.get('return-method') ?? (options.get('ref') ? 'git-branch' : 'ssh-pull')
+  const pass = booleanOption(options, 'pass')
+  const ownership = pass ? 'receiver' : 'sender'
+  const method = pass ? 'none' : options.get('return-method') ?? (options.get('ref') ? 'git-branch' : 'ssh-pull')
   const heartbeatSeconds = Number(options.get('heartbeat-seconds') ?? w.heartbeatSeconds ?? 300)
   const maxStaleSeconds = Number(options.get('max-stale-seconds') ?? w.maxStaleSeconds ?? 900)
   const deadlineMinutes = Number(options.get('deadline-minutes') ?? w.deadlineMinutes ?? 60)
@@ -245,7 +248,7 @@ function prepare(options) {
   writeFileSync(join(outDir, 'context.paths'), `${contextInfo.paths.join('\n')}\n`)
 
   const body = {
-    dispatchId, type: 'dispatch', protocol: 'dep/1',
+    dispatchId, type: pass ? 'pass' : 'dispatch', protocol: 'dep/1', ownership,
     sender: options.get('sender') ?? 'dispatch-sender',
     return: { method, dir: `${remoteDir}/return`, ...(options.get('ref') ? { ref: options.get('ref') } : {}) },
     context: { manifestHash: contextInfo.manifestHash, root: `${remoteDir}/context` },
@@ -254,14 +257,14 @@ function prepare(options) {
   }
   writeJsonFile(join(outDir, 'envelope.json'), signObject(key, body))
   appendLedger({
-    at: new Date().toISOString(), dispatchId, worker: w.name ?? options.get('worker') ?? null, ssh, mode: method,
+    at: new Date().toISOString(), dispatchId, worker: w.name ?? options.get('worker') ?? null, ssh, mode: method, ownership,
     ref: options.get('ref') ?? null, remoteDir, localOutDir: outDir, contextRoot: root,
     contextManifest: contextInfo.manifestHash, key, tmuxSession: dispatchId, heartbeatSeconds, maxStaleSeconds,
     deadline: body.deadline, status: 'prepared', gate,
   })
   const { paths, ...contextSummary } = contextInfo
   return {
-    dispatchId, remoteDir, envelope: join(outDir, 'envelope.json'), manifest: contextSummary, deadline: body.deadline,
+    dispatchId, remoteDir, ownership, envelope: join(outDir, 'envelope.json'), manifest: contextSummary, deadline: body.deadline,
     next: `node dispatch.mjs transfer ${dispatchId} [--bundle <f> | --branch <ref> --repo-url <url> | (files: nothing extra)]`,
   }
 }
@@ -296,7 +299,7 @@ function transfer(id, options) {
   mark(id, manifestMatch ? 'transferred' : 'transfer-mismatch', { remoteDir, placed })
   return {
     result: { dispatchId: id, remoteDir, placed, manifestMatch, expected: L.contextManifest, remote: remote.manifestHash, remoteFileCount: remote.fileCount,
-      next: manifestMatch ? `node dispatch.mjs launch ${id} --agent "<agentCommand>" [--mode interactive|headless]` : 'context did not arrive intact — fix and re-run transfer; do NOT launch' },
+      next: manifestMatch ? `node dispatch.mjs launch ${id} --agent "<agentCommand>"${L.ownership === 'receiver' ? ' --mode interactive' : ' [--mode interactive|headless]'}` : 'context did not arrive intact — fix and re-run transfer; do NOT launch' },
     ok: manifestMatch,
   }
 }
@@ -308,6 +311,7 @@ function launch(id, options) {
   const agent = options.get('agent') ?? workerEntry(L.worker).agentCommand
   if (!agent) throw new Error('Missing --agent')
   const mode = options.get('mode') ?? 'interactive'
+  if (L.ownership === 'receiver' && mode !== 'interactive') throw new Error('A passed dispatch requires --mode interactive so the receiver keeps the live session')
   const D = L.remoteDir
   writeRemote(L.ssh, `${D}/receiver.md`, receiverPrompt(L))
   const run = mode === 'headless'
@@ -338,6 +342,23 @@ function launch(id, options) {
 }
 
 function receiverPrompt(L) {
+  if (L.ownership === 'receiver') {
+    return [
+      `You are receiving full ownership of a passed dispatch. Your working directory is ${L.remoteDir}. The signed handoff packet is inside envelope.json and will be printed by step 1.`,
+      '',
+      'Run these commands (with your shell tool), in order:',
+      '1. node dispatch.mjs worker init',
+      '   This verifies the handoff signature and workspace manifest, then prints the task, current state, constraints, and gate. If it prints "refuse", stop and do nothing else.',
+      '2. node dispatch.mjs worker ack --understanding "<what you are taking over>" --plan "<remaining plan>" --next-step "<the exact first action>" --will-not-do "<what is out of scope>" --readiness ready',
+      '   This signed acknowledgment is the release gate. Be exact. The sender retains responsibility until it accepts this acknowledgment.',
+      '3. Continue the task in ./context. Ownership is yours after release. Do not wait for sender supervision and do not package work for sender collection.',
+      '   You may record milestones with: node dispatch.mjs worker heartbeat --status working --progress "<one line>"',
+      '4. When the work reaches a terminal state, record it with worker done or worker failed. This is a durable record, not a request for the sender to collect.',
+      '',
+      'Files named steer-N.md may appear before release if the sender needs to correct the acknowledgment. After release, coordinate through the user or initiate a new passed dispatch back.',
+      '',
+    ].join('\n')
+  }
   return [
     `You are a dispatch worker. Your working directory is ${L.remoteDir}. Everything you need is here; the task itself is inside envelope.json and will be printed by step 1.`,
     '',
@@ -364,13 +385,13 @@ function awaitAck(id, options) {
   const timeout = Number(options.get('timeout-seconds') ?? 120)
   const start = Date.now()
   while (true) {
-    const r = ssh(L.ssh, `cat '${L.remoteDir}/return/ack.json' 2>/dev/null`, { allowFail: true })
-    if (r.status === 0 && r.stdout.trim()) {
-      const ack = JSON.parse(r.stdout)
-      const verified = verifyObject(L.key, ack) && ack.dispatchId === id && ack.contextManifestVerified === true
-      mark(id, verified ? 'dispatched' : 'ack-unverified', {})
-      return { result: { dispatchId: id, ack: verified ? 'verified' : 'INVALID', understanding: ack.understanding, plan: ack.plan, willNotDo: ack.willNotDo, gate: ack.gate, agent: ack.agent,
-        next: verified ? `node dispatch.mjs follow ${id}` : 'stop — unverified ack is not a started dispatch' }, ok: verified }
+    const read = readRemoteAck(L)
+    if (read.found) {
+      const { ack, verified, reasons } = read
+      mark(id, verified ? L.ownership === 'receiver' ? 'acknowledged' : 'dispatched' : 'ack-unverified', {})
+      return { result: { dispatchId: id, ownership: L.ownership, ack: verified ? 'verified' : 'INVALID', reasons, understanding: ack.understanding, plan: ack.plan,
+        nextStep: ack.nextStep ?? null, willNotDo: ack.willNotDo, gate: ack.gate, readiness: ack.readiness ?? null, agent: ack.agent,
+        next: verified ? L.ownership === 'receiver' ? `inspect this acknowledgment; correct it with steer if needed, then: node dispatch.mjs release ${id}` : `node dispatch.mjs follow ${id}` : 'stop — unverified or incomplete ack is not a started dispatch' }, ok: verified }
     }
     if (Date.now() - start > timeout * 1000) {
       return { result: { dispatchId: id, ack: 'none', elapsedSeconds: Math.round((Date.now() - start) / 1000), pane: pane(L, 60),
@@ -378,6 +399,49 @@ function awaitAck(id, options) {
     }
     sleep(Number(options.get('poll-seconds') ?? 20) * 1000)
   }
+}
+
+// release — pass-mode ownership changes only after the receiver proves file
+// parity and acknowledges the task, exact next step, gate, and readiness.
+function release(id) {
+  const L = ledgerFor(id)
+  if (L.ownership !== 'receiver') return { result: { dispatchId: id, released: false, reason: 'not-a-passed-dispatch' }, ok: false }
+  if (L.status === 'released') {
+    return { result: { dispatchId: id, released: true, ownership: 'receiver', remoteDir: L.remoteDir, attach: `ssh -t ${L.ssh} 'tmux attach -t ${id}'`, reason: 'already-released' }, ok: true }
+  }
+  const read = readRemoteAck(L)
+  const sessionAlive = ssh(L.ssh, `tmux display-message -p -t '${id}:agent' '#{pane_dead}' 2>/dev/null`, { allowFail: true }).stdout.trim() === '0'
+  if (!read.verified || !sessionAlive) {
+    return { result: { dispatchId: id, released: false, ack: read.found ? 'INVALID' : 'none', reasons: read.reasons, sessionAlive,
+      pane: pane(L, 60), next: 'keep sender responsibility; correct the receiver acknowledgment or session, then retry release' }, ok: false }
+  }
+  const releasedAt = new Date().toISOString()
+  mark(id, 'released', { releasedAt })
+  return { result: { dispatchId: id, released: true, ownership: 'receiver', releasedAt, remoteDir: L.remoteDir, manifestHash: L.contextManifest,
+    understanding: read.ack.understanding, nextStep: read.ack.nextStep, gate: read.ack.gate, attach: `ssh -t ${L.ssh} 'tmux attach -t ${id}'`,
+    next: 'sender responsibility is released; do not follow, steer, collect, or remove this workspace unless the user explicitly takes ownership back' }, ok: true }
+}
+
+function readRemoteAck(L) {
+  const r = ssh(L.ssh, `cat '${L.remoteDir}/return/ack.json' 2>/dev/null`, { allowFail: true })
+  if (r.status !== 0 || !r.stdout.trim()) return { found: false, verified: false, reasons: ['ack-missing'], ack: {} }
+  let ack
+  try { ack = JSON.parse(r.stdout) } catch { return { found: true, verified: false, reasons: ['ack-invalid-json'], ack: {} } }
+  const checks = [
+    ['signature', verifyObject(L.key, ack)],
+    ['dispatch-id', ack.dispatchId === L.dispatchId],
+    ['workspace-manifest', ack.contextManifestVerified === true],
+  ]
+  if (L.ownership === 'receiver') checks.push(
+    ['workspace-path', ack.workspace === L.remoteDir],
+    ['manifest-hash', ack.contextManifest === L.contextManifest],
+    ['task-understanding', typeof ack.understanding === 'string' && ack.understanding.trim().length > 0],
+    ['next-step', typeof ack.nextStep === 'string' && ack.nextStep.trim().length > 0],
+    ['verification-gate', ack.gate === L.gate],
+    ['readiness', ack.readiness === 'ready'],
+  )
+  const reasons = checks.filter(([, ok]) => !ok).map(([name]) => name)
+  return { found: true, verified: reasons.length === 0, reasons, ack }
 }
 
 // status — pull the latest signed signal and judge it; includes the pane on
@@ -397,9 +461,11 @@ function status(id, options) {
       ? judge(sig, L.maxStaleSeconds, L.deadline)
       : { result: { verified: false, verdict: 'unverified' }, ok: false }
   }
-  out.result = { dispatchId: id, ...out.result, sessionAlive: alive }
+  out.result = { dispatchId: id, ownership: L.ownership ?? 'sender', released: L.status === 'released', ...out.result, sessionAlive: alive }
   if (!['alive', 'done'].includes(out.result.verdict) || options.get('pane') === 'true') out.result.pane = pane(L, Number(options.get('lines') ?? 40))
-  if (['done', 'failed'].includes(out.result.verdict)) out.result.next = `node dispatch.mjs collect ${id} --into <fresh-empty-dir>`
+  if (['done', 'failed'].includes(out.result.verdict)) out.result.next = L.ownership === 'receiver'
+    ? 'receiver owns this passed dispatch; there is nothing for the sender to collect'
+    : `node dispatch.mjs collect ${id} --into <fresh-empty-dir>`
   return out
 }
 
@@ -432,6 +498,7 @@ function pane(L, lines) {
 // (e.g. "2 Enter" to skip a codex self-update prompt, "C-c" to interrupt).
 function steer(id, options) {
   const L = ledgerFor(id)
+  if (L.ownership === 'receiver' && L.status === 'released') throw new Error('Cannot steer a released pass: the receiver owns the session')
   if (options.get('keys')) {
     ssh(L.ssh, `tmux send-keys -t '${id}:agent' ${options.get('keys')}`)
     sleep(2000)
@@ -451,6 +518,7 @@ function steer(id, options) {
 // integrity, and hand back the gate to run. Integration stays with you.
 function collect(id, options) {
   const L = ledgerFor(id)
+  if (L.ownership === 'receiver') throw new Error('Cannot collect a passed dispatch: ownership and the working copy belong to the receiver')
   const into = resolve(requiredOption(options, 'into'))
   if (existsSync(into) && readdirSync(into).length) throw new Error(`--into must be a fresh/empty directory: ${into}`)
   mkdirSync(into, { recursive: true })
@@ -485,6 +553,7 @@ function collect(id, options) {
 // --purge) remove ONLY the verified dispatch dir.
 function recall(id, options) {
   const L = ledgerFor(id)
+  if (L.ownership === 'receiver' && L.status === 'released' && !booleanOption(options, 'force')) throw new Error('Cannot recall a released pass without an explicit --force; this may destroy receiver-owned work')
   ssh(L.ssh, `tmux send-keys -t '${id}:agent' C-c 2>/dev/null; for s in '${id}' '${id}-web' '${id}-tun'; do tmux kill-session -t "$s" 2>/dev/null; done; true`)
   let purged = false
   if (options.get('purge') === 'true') {
@@ -529,12 +598,16 @@ function workerMain(argv) {
       const m = manifest(new Map([['root', join(dir, 'context')]]))
       if (m.manifestHash !== env.context.manifestHash) return printJson({ verdict: 'refuse', reason: 'context manifest mismatch', expected: env.context.manifestHash, actual: m.manifestHash })
       heartbeat('working', 'initialized')
-      return printJson({ verdict: 'ok', dispatchId: env.dispatchId, prompt: env.prompt, constraints: env.constraints, gate: env.gate, return: env.return, heartbeatSeconds: env.heartbeatSeconds, deadline: env.deadline, contextFiles: m.fileCount })
+      return printJson({ verdict: 'ok', dispatchId: env.dispatchId, ownership: env.ownership ?? 'sender', prompt: env.prompt, constraints: env.constraints, gate: env.gate, return: env.return, heartbeatSeconds: env.heartbeatSeconds, deadline: env.deadline, contextFiles: m.fileCount })
     }
-    case 'ack':
+    case 'ack': {
+      const pass = env.ownership === 'receiver'
       write('ack.json', { type: 'ack', agent: options.get('agent') ?? process.env.DISPATCH_AGENT ?? 'unknown', workspace: dir, contextManifestVerified: manifest(new Map([['root', join(dir, 'context')]])).manifestHash === env.context.manifestHash,
-        understanding: requiredOption(options, 'understanding'), plan: requiredOption(options, 'plan'), willNotDo: options.get('will-not-do') ?? '', gate: env.gate })
+        contextManifest: env.context.manifestHash, understanding: requiredOption(options, 'understanding'), plan: requiredOption(options, 'plan'),
+        nextStep: pass ? requiredOption(options, 'next-step') : options.get('next-step') ?? '', willNotDo: options.get('will-not-do') ?? '', gate: env.gate,
+        readiness: pass ? requiredOption(options, 'readiness') : options.get('readiness') ?? null })
       return printJson({ written: 'return/ack.json' })
+    }
     case 'heartbeat':
       heartbeat(options.get('status') ?? 'working', options.get('progress') ?? '')
       return printJson({ written: 'return/heartbeat.json', status: options.get('status') ?? 'working' })
@@ -723,12 +796,26 @@ function assertSafeRelativePath(path) {
 
 function parseOptions(args) {
   const options = new Map()
-  for (let index = 0; index < args.length; index += 2) {
-    const key = args[index], value = args[index + 1]
-    if (!key?.startsWith('--') || value === undefined) usage()
-    options.set(key.slice(2), value)
+  const bareFlags = new Set(['pass', 'force'])
+  for (let index = 0; index < args.length;) {
+    const key = args[index]
+    if (!key?.startsWith('--')) usage()
+    const name = key.slice(2)
+    const value = args[index + 1]
+    if (value === undefined || value.startsWith('--')) {
+      if (!bareFlags.has(name)) usage()
+      options.set(name, 'true')
+      index += 1
+    } else {
+      options.set(name, value)
+      index += 2
+    }
   }
   return options
+}
+function booleanOption(options, key) {
+  const value = options.get(key)
+  return value === 'true' || value === '1' || value === 'yes'
 }
 function requiredOption(options, key) {
   const value = options.get(key)
@@ -750,20 +837,21 @@ sender (everything after prepare is resolved from the ledger by <id>):
   check [worker]                       reachable/node/tmux/agent + auth probe; records lastAuthOkAt
   prepare   --worker <name> --root <dir> --prompt-file <f> --gate <text> --out-dir <dir>
             [--paths-file <f>] [--constraints "a;b"] [--ref <branch>] [--return-method ssh-pull|git-branch]
-            [--ssh <dest>] [--dispatch-dir <d>] [--heartbeat-seconds N] [--max-stale-seconds N] [--deadline-minutes N] [--sender <id>]
+            [--pass] [--ssh <dest>] [--dispatch-dir <d>] [--heartbeat-seconds N] [--max-stale-seconds N] [--deadline-minutes N] [--sender <id>]
   transfer  <id> [--bundle <f> | --branch <ref> --repo-url <url>]   (default: curated files)
   launch    <id> [--agent "<cmd>"] [--mode interactive|headless] [--settle-seconds N] [--pulse false]
   await-ack <id> [--timeout-seconds 120] [--poll-seconds 20]
+  release   <id>                              pass mode: release sender ownership after verified ack
   status    <id> [--pane true] [--lines N]
   follow    <id> [--interval-seconds N]        loops until a verdict needs you; run in background
   pane      <id> [--lines N]
   steer     <id> --file <instruction.md> | --keys "<tmux keys>"
   collect   <id> --into <fresh-empty-dir>
-  recall    <id> [--purge true]
+  recall    <id> [--purge true] [--force]      --force is required after pass-mode release
   mark      <id> --status <collected|failed|...>
   sessions | history
 worker (run inside the dispatch dir):
-  worker init | ack --understanding .. --plan .. [--will-not-do ..] | heartbeat --status working|blocked --progress ..
+  worker init | ack --understanding .. --plan .. [--next-step ..] [--will-not-do ..] [--readiness ready] | heartbeat --status working|blocked --progress ..
   worker done|failed --summary .. [--notes ..] | pulse
 primitives: keygen | manifest --root <dir> [--paths-file f] [--out f] | sign --key --in [--out] | verify --key --in
             check-heartbeat --key --in [--max-stale-seconds N] [--deadline iso] | verify-result --key --result [--root d | --bundle f]

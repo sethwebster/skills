@@ -6,16 +6,16 @@ Claude Code plugin marketplace for my agent skills.
 
 ```
 /plugin marketplace add sethwebster/skills
-/plugin install baton@skills
+/plugin install dispatch@skills
 ```
 
 ## Plugins
 
 | Plugin | Description |
 | --- | --- |
-| [baton](./plugins/baton) | Verified session/workspace handoff between agents across machines — file parity first, agent launch second, receiver ack third, sender release last. |
-| [dispatch](./plugins/dispatch) | Delegate a scoped task to a remote agent over SSH and get the verified result back — authenticated handshake, right-sized context, HMAC-signed heartbeats, verified-before-integration. You stay the orchestrator. |
+| [dispatch](./plugins/dispatch) | Delegate remote work and collect a verified result, or use `--pass` to hand over the full task and workspace after a signed receiver acknowledgment. |
+| [upstream](./plugins/upstream) | Run issue-linked upstream work in an isolated worktree, from specification and draft PR through small commits, independent reviews, and bot-feedback monitoring. |
 
 ## Maintenance
 
-Plugins are vendored under `plugins/<name>/`. Each plugin's source of truth lives in its own project (baton: `ai-projects/handoff`); copy updated `SKILL.md`/`scripts` here and bump the version in both `plugin.json` and `marketplace.json` when releasing. `evals/` stays in the source project — never ship it.
+Plugins are vendored under `plugins/<name>/`. Copy updated skills and scripts here, then bump the version in both `plugin.json` and `marketplace.json` when releasing. Keep evaluation fixtures in the source project rather than shipping them.

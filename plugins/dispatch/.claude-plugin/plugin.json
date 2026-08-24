@@ -1,6 +1,9 @@
 {
   "name": "dispatch",
-  "description": "Delegate a scoped task to a remote agent over SSH and get the verified result back. Authenticated handshake, right-sized context, HMAC-signed heartbeats, verified-before-integration — you stay the orchestrator. Toggle fleet availability for a periodic auto-offload reminder.",
-  "version": "0.7.0",
-  "keywords": ["dispatch", "delegate", "remote", "agent", "ssh", "tmux"]
+  "description": "Delegate remote work and collect a verified result, or use --pass to hand over the full task and workspace after a signed receiver acknowledgment.",
+  "version": "0.8.0",
+  "author": {
+    "name": "Seth Webster"
+  },
+  "keywords": ["dispatch", "delegate", "handoff", "remote", "agent", "ssh", "tmux"]
 }
