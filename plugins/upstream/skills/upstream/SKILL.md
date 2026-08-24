@@ -22,8 +22,10 @@ Before any route:
 1. Find the repository root and inspect `git status`, existing worktrees, remotes, current branch, and the GitHub CLI authentication state. Preserve unrelated changes.
 2. Resolve the upstream repository and its base branch. Prefer a configured `upstream` remote, then the parent of an `origin` fork, then `origin` when it is not a fork. The base is `main` unless the user or repository rules specify another branch. If `main` does not exist, use the upstream default branch and state why.
 3. Resolve a writable push remote separately from the upstream repository. Prefer the user's fork at `origin`. Ask before creating a fork or changing a remote whose purpose is ambiguous.
-4. Read every applicable `AGENTS.md`, `CLAUDE.md`, `CONTRIBUTING*`, pull request template, issue template, and documented branch, worktree, test, commit, or review rule before making changes. Repository rules win over this skill's defaults.
-5. Use `gh` with an explicit upstream repository for searches and mutations. Report a missing login, permissions failure, or ambiguous repository instead of operating on a guessed target.
+4. Locate the upstream contributing guide before making changes. Check the repository root, `.github/`, and `docs/` for `CONTRIBUTING`, `CONTRIB`, and `CONTRIBUTE` under any extension, and follow a stub that points elsewhere. Read it from the resolved upstream repository at its base branch, not only from the local checkout, because a fork or stale branch may lack the current guide.
+5. Read every other applicable `AGENTS.md`, `CLAUDE.md`, code of conduct, pull request template, issue template, and documented branch, worktree, test, commit, or review rule. Repository rules win over this skill's defaults.
+6. Extract the contributing guide's operative requirements and carry them into the run: issue-first or discussion-first policy, CLA or DCO sign-off, branch naming, commit message and changelog conventions, required tests, lint and formatting gates, review expectations, and how to submit. Follow them over this skill's defaults, and say which requirement you are following when the two disagree. State the absence explicitly when no guide exists, and fall back to observed repository convention.
+7. Use `gh` with an explicit upstream repository for searches and mutations. Report a missing login, permissions failure, or ambiguous repository instead of operating on a guessed target.
 
 Keep these identities distinct throughout the run:
 

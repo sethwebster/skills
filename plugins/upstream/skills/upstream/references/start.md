@@ -16,7 +16,7 @@ For the strongest candidates, also check linked pull requests and open pull requ
 
 Recommend one choice based on the evidence. An open pull request owned by somebody else is not writable by default. Ask before building a competing PR or changing their branch.
 
-If no candidate is credible, state that the search found no match and start anew. Starting anew does not create an issue unless the user asks or upstream rules require one.
+If no candidate is credible, state that the search found no match and start anew. Starting anew does not create an issue unless the user asks or upstream rules require one. When the contributing guide requires an issue or discussion before a pull request, satisfy that requirement first and link what it produces.
 
 When attaching to an issue, carry its acceptance criteria and constraints into the specification. Use `Refs #N` in the draft PR unless the agreed scope resolves the whole issue, in which case use the repository's closing convention.
 
@@ -78,7 +78,7 @@ Work from the draft PR checklist. For each smallest coherent unit:
 1. Implement only the current item and its necessary tests.
 2. Run the narrowest meaningful verification, then any repository-required gate.
 3. Review the diff for accidental files, unrelated formatting, generated output, and secrets.
-4. Commit with a focused subject. In the commit body, name the checklist item, summarize the change, and record any difference from the plan.
+4. Commit with a focused subject, following the contributing guide's message convention and adding any required sign-off or changelog entry. In the commit body, name the checklist item, summarize the change, and record any difference from the plan.
 5. Push the commit to the writable fork.
 6. Read-modify-write the PR body to check completed items and append material deviations or newly agreed work.
 
