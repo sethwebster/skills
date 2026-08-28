@@ -1,0 +1,9 @@
+{
+  "name": "consensus",
+  "description": "Ask multiple AI model CLIs one question in parallel, then synthesize a canonical answer with dissent surfaced.",
+  "version": "0.2.0",
+  "author": {
+    "name": "Seth Webster"
+  },
+  "keywords": ["consensus", "multi-model", "cross-check", "llm", "claude", "codex", "gemini"]
+}

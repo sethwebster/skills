@@ -3,7 +3,7 @@
   "owner": {
     "name": "Seth Webster"
   },
-  "description": "Personal Claude Code plugins for remote agent workflows and upstream contributions.",
+  "description": "Personal Claude Code plugins for remote agent workflows, upstream contributions, and cross-model consensus.",
   "plugins": [
     {
       "name": "dispatch",
@@ -18,6 +18,15 @@
       "name": "upstream",
       "source": "./plugins/upstream",
       "description": "Run issue-linked upstream work in an isolated worktree, from specification and draft PR through small commits, independent reviews, and bot-feedback monitoring.",
+      "version": "0.2.0",
+      "author": {
+        "name": "Seth Webster"
+      }
+    },
+    {
+      "name": "consensus",
+      "source": "./plugins/consensus",
+      "description": "Ask multiple AI model CLIs one question in parallel, then synthesize a canonical answer with dissent surfaced.",
       "version": "0.2.0",
       "author": {
         "name": "Seth Webster"
