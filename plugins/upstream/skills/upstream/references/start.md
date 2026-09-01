@@ -44,8 +44,8 @@ Completion criterion: the user has agreed to a plan whose checklist items each h
 Fetch the upstream base and create a new worktree at that fetched commit. Follow repository naming and worktree-location rules. Otherwise:
 
 - derive a short lowercase hyphenated slug from the agreed title
-- name the branch `upstream/<slug>`
-- put the worktree in a non-conflicting sibling path such as `<repo>-<slug>`
+- name the branch with the configured `rules.branchPrefix` (default `upstream/`) plus the slug
+- put the worktree in a non-conflicting sibling path from the configured `rules.worktreePattern` (default `<repo>-<slug>`)
 
 Check local branches, remote branches, and registered worktrees for collisions before creation. Never reuse a dirty worktree. Set the branch to push to the writable fork while the pull request targets the upstream base.
 
@@ -101,13 +101,15 @@ Completion criterion: both fresh reviews are green, required tests and checks pa
 
 Mark the PR ready for review only after the prior completion criterion passes. Capture a baseline of reviews, review comments, issue comments on the PR, and status checks.
 
-Use the environment's recurring monitor or scheduled wake-up when available. Otherwise run a background polling loop. Poll exactly every five minutes. At each cycle, compare stable IDs, timestamps, authors, and check conclusions with the last snapshot. New automated feedback includes:
+Monitoring cadence comes from the project config's `rules.monitor` (see [config.md](config.md)): poll every `pollMinutes` (default five) and settle after `settleCycles` consecutive quiet polls (default six). When `settleCycles` is `0`, skip polling entirely: report the baseline and stop here. If the user asks for a different cadence for this repository, persist it to the config before continuing.
+
+Use the environment's recurring monitor or scheduled wake-up when available. Otherwise run a background polling loop. Poll exactly at the configured interval. At each cycle, compare stable IDs, timestamps, authors, and check conclusions with the last snapshot. New automated feedback includes:
 
 - a new review or comment from a GitHub App or an author whose login ends in `[bot]`
 - a status check that newly becomes failed, cancelled, timed out, or action required
 
 When new feedback arrives, reset the no-feedback counter to zero. Read the full feedback, decide whether it applies, and address actionable items with the same test, commit, push, and PR-checklist discipline. Explain a rejected suggestion with evidence in the relevant thread when possible. Rerun affected review and security gates after a material change.
 
-Increment the counter only when a scheduled poll finds no new automated feedback. Stop after six consecutive no-feedback cycles. Also stop for a permission block or a user interruption. Do not merge the PR.
+Increment the counter only when a scheduled poll finds no new automated feedback. Stop after the configured number of consecutive no-feedback cycles. Also stop for a permission block or a user interruption. Do not merge the PR.
 
-At the end, report the PR URL, linked issue, branch and worktree, checks run, review result, bot feedback handled, and why monitoring stopped. Report pending checks honestly if the six-cycle limit expires first.
+At the end, report the PR URL, linked issue, branch and worktree, checks run, review result, bot feedback handled, and why monitoring stopped. Report pending checks honestly if the settle limit expires first.
