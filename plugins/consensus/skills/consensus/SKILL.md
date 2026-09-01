@@ -8,8 +8,7 @@ description: >-
   opinion, a multi-model cross-check, to reconcile conflicting answers, or wants
   higher confidence on a high-stakes, contested, or easy-to-get-subtly-wrong
   question — or when you want to verify a risky claim against other models before
-  relying on it. Drives the `consensus` CLI over the shell; requires `consensus` on
-  PATH.
+  relying on it. Runs the `consensus` CLI through npx.
 license: MIT
 ---
 
@@ -40,14 +39,13 @@ answering directly — spend it where cross-checking actually changes the outcom
 
 ## Preconditions
 
-`consensus` is a separate CLI; this skill does not bundle it. Before the first use:
+`consensus` is a separate CLI; this skill does not bundle or install it globally.
+Run it through npx so npm can fetch it when needed. Before the first use:
 
 ```bash
-command -v consensus || echo "consensus not installed"   # must resolve
-consensus detect                                          # shows which model CLIs are found
+npx --yes @sethwebster/consensus detect
 ```
 
-- If `consensus` is missing, tell the user to install it (`npm install -g @sethwebster/consensus`, or `npm install && npm run build && npm install -g .` from the repo) rather than trying to work around it.
 - `consensus` finds model CLIs already on PATH and reuses each one's existing auth — it never needs API keys. If `detect` shows fewer than two usable CLIs, say so: with only one responder there is nothing to reconcile.
 
 ## Running it
@@ -59,13 +57,13 @@ clean answer.
 For anything you will parse yourself, use `--json`:
 
 ```bash
-consensus --json "when should I choose a monorepo over a polyrepo?"
+npx --yes @sethwebster/consensus --json "when should I choose a monorepo over a polyrepo?"
 ```
 
 For a human-readable answer, drop `--json`:
 
 ```bash
-consensus "review this rate-limiter design for race conditions"
+npx --yes @sethwebster/consensus "review this rate-limiter design for race conditions"
 ```
 
 Useful flags (all optional):
@@ -81,8 +79,9 @@ Useful flags (all optional):
 | `-f, --file <path>` | Read the prompt from a file instead of an argument. |
 | `-o, --out <path>` | Also write a full markdown transcript. |
 
-Piping works too: `cat spec.md | consensus` sends the piped text as the whole
-prompt; `cat spec.md | consensus - "critique this"` adds an instruction.
+Piping works too: `cat spec.md | npx --yes @sethwebster/consensus` sends the piped
+text as the whole prompt; `cat spec.md | npx --yes @sethwebster/consensus - "critique this"`
+adds an instruction.
 
 Note: members run in the working directory and may write their own state there
 (`.codegraph`, `.omo`, …). If that matters, pass `--cwd` to redirect them.
