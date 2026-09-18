@@ -1,0 +1,15 @@
+{
+  "name": "unslop",
+  "description": "Cut AI tells from any writing. Must always apply.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Seth Webster"
+  },
+  "keywords": [
+    "writing",
+    "editing",
+    "style",
+    "ai-tells",
+    "prose"
+  ]
+}
